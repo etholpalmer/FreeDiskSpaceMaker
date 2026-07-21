@@ -63,6 +63,28 @@ let run () =
         assertEqual [ "a"; "b"; "c" ] (Path.segments "/a/b/c") "absolute path segments"
         assertEqual ([]: string list) (Path.segments "/") "root has no segments")
 
+    let isWindows =
+        Runtime.InteropServices.RuntimeInformation.IsOSPlatform Runtime.InteropServices.OSPlatform.Windows
+
+    if not isWindows then
+        test "segments preserves a backslash inside a filename on POSIX" (fun () ->
+            let result = Path.segments "/tmp/back\\slash"
+            assertEqual 2 result.Length "backslash is not a separator on POSIX"
+            assertEqual "back\\slash" (List.last result) "backslash stays part of the segment")
+
+        test "normalize does not treat a `..` inside a filename as a parent reference on POSIX" (fun () ->
+            let result = Path.normalize "/allow/root/x\\../secret"
+            assertFalse (result = "/allow/root/secret") "x\\.. must not collapse to a traversal"
+            assertContains "x\\.." result "the literal directory name is retained")
+
+        test "isDescendantOf keeps the literal component rather than popping a segment on POSIX" (fun () ->
+            assertTrue (Path.isDescendantOf "/allow/root" "/allow/root/x\\../secret") "genuinely inside, since x\\.. is one directory name"
+            let normalized = Path.normalize "/allow/root/x\\../secret"
+            assertContains "x\\.." normalized "no segment was popped by a fake dot-dot")
+
+    test "isDescendantOf still rejects a genuine traversal escape" (fun () ->
+        assertFalse (Path.isDescendantOf "/a/b" "/a/b/../../etc/passwd") "real dot-dot segments still escape")
+
     suite "Utilities.Result"
 
     test "traverse collects all errors rather than stopping at the first" (fun () ->

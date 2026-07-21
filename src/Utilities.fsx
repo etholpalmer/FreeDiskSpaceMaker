@@ -52,10 +52,29 @@ module Path =
         Runtime.InteropServices.RuntimeInformation.IsOSPlatform Runtime.InteropServices.OSPlatform.OSX
         || Runtime.InteropServices.RuntimeInformation.IsOSPlatform Runtime.InteropServices.OSPlatform.Windows
 
-    /// Splits a path into its non-empty segments.
+    /// True when the running platform treats `\` as a path separator.
+    /// Windows does; macOS and Linux treat `\` as an ordinary filename character.
+    let private isWindows =
+        Runtime.InteropServices.RuntimeInformation.IsOSPlatform Runtime.InteropServices.OSPlatform.Windows
+
+    let private separatorChars =
+        if isWindows then [| '/'; '\\' |] else [| '/' |]
+
+    /// Splits a path into its non-empty segments. On Windows, both `/` and
+    /// `\` separate segments; on macOS and Linux, only `/` does, since `\`
+    /// is a legal filename character on those platforms.
     let segments (path: string) : string list =
-        path.Split([| '/'; '\\' |], StringSplitOptions.RemoveEmptyEntries)
+        path.Split(separatorChars, StringSplitOptions.RemoveEmptyEntries)
         |> Array.toList
+
+    /// True when `path` begins with a Windows drive letter (`C:\` or `D:/`).
+    /// Checked independent of the running platform, since it is a syntactic
+    /// property of the path string rather than a platform behavior.
+    let private hasDriveLetter (path: string) : bool =
+        path.Length >= 2
+        && Char.IsLetter path.[0]
+        && path.[1] = ':'
+        && (path.Length = 2 || path.[2] = '/' || path.[2] = '\\')
 
     /// Normalizes a path for comparison: resolves `.` and `..`, collapses
     /// duplicate separators, removes any trailing separator, and applies
@@ -64,7 +83,10 @@ module Path =
     let normalize (path: string) : string =
         if String.IsNullOrWhiteSpace path then ""
         else
-            let isAbsolute = path.StartsWith "/" || path.StartsWith "\\"
+            let hasDrive = hasDriveLetter path
+            let isAbsolute =
+                hasDrive
+                || (path.Length > 0 && Array.contains path.[0] separatorChars)
             let resolved =
                 segments path
                 |> List.fold (fun acc segment ->
@@ -75,7 +97,8 @@ module Path =
                 |> List.rev
             let joined = String.Join(string separator, resolved)
             let withRoot =
-                if isAbsolute then string separator + joined
+                if hasDrive then joined
+                elif isAbsolute then string separator + joined
                 else joined
             let trimmed =
                 if withRoot.Length > 1 && withRoot.EndsWith(string separator)
@@ -106,12 +129,12 @@ module Path =
     let isDescendantOf (ancestor: string) (candidate: string) : bool =
         let a = normalize ancestor
         let c = normalize candidate
+        let comparison =
+            if platformIsCaseInsensitive then StringComparison.OrdinalIgnoreCase
+            else StringComparison.Ordinal
         if a = "" || c = "" then false
-        elif equals a c then false
+        elif String.Equals(a, c, comparison) then false
         else
-            let comparison =
-                if platformIsCaseInsensitive then StringComparison.OrdinalIgnoreCase
-                else StringComparison.Ordinal
             let prefix = if a.EndsWith(string separator) then a else a + string separator
             c.StartsWith(prefix, comparison)
 
