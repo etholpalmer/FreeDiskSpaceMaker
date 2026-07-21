@@ -19,8 +19,8 @@ These apply to **every task**. Each task's requirements implicitly include this 
 - **No build step.** Everything runs via `dotnet fsi`. No `.fsproj`.
 - **File size:** 150–400 lines per module, 800 absolute maximum. Split if exceeded.
 - **Every public function has an XML doc comment** (`/// <summary>`). Every module begins with a `(** ... *)` module-level doc block.
-- **Immutable data.** Records and DUs. `mutable` only inside a function body where profiling justifies it, with a comment stating why.
-- **`Result<'T,'Error>` for all fallible operations.** No exceptions for control flow. Exceptions from BCL calls are caught at the boundary and converted to `Result`.
+- **Immutable data.** Records and DUs. `mutable` only where a module-header comment states the justification. **Adjudicated carve-out:** `src/Diagnostics.fsx` uses mutable record fields with `Interlocked`. Counters increment once per filesystem entry across threads; immutable updates would allocate on the hottest path in the program. This is approved — do not flag it.
+- **`Result<'T,'Error>` for all fallible operations.** No exceptions for control flow. Exceptions from BCL calls are caught at the boundary and converted to `Result`. **Adjudicated carve-out:** this constraint binds `src/` only. `tests/TestFramework.fsx` raises `AssertionFailure` to abort a failing test mid-body; threading `Result` through every assertion would make tests noisier than the code they verify. This is approved — do not flag it.
 - **Pipeline operators** (`|>`) for data flow. Active patterns where they clarify matching.
 - **Commit after every task** using Conventional Commits (`feat:`, `test:`, `fix:`, `docs:`, `refactor:`).
 - **No AI attribution trailers in commit messages.** No `Co-Authored-By: Claude`, no `Generated with`, no 🤖 lines. This is a hard project rule.
