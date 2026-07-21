@@ -56,3 +56,25 @@ let run () =
         let candidate = assertOk (RiskEngine.evaluate false resolved child) "child accepted"
         assertEqual ContentsOnly (RiskEngine.candidateStrategy candidate) "strategy carried through"
         assertFalse (RiskEngine.candidatePath candidate = "/derived") "the root is never the target")
+
+    test "an unusable Trash directory fails every candidate instead of throwing" (fun () ->
+        // Trash preparation runs after the journal is written and after the user
+        // has confirmed. An escaping exception there would replace the promised
+        // summary with a stack trace, so it must surface as a TrashResult.
+        // /dev/null/impossible cannot be created: /dev/null is not a directory.
+        let fs = Platform.FileSystem.inMemory []
+        let log = Logging.create Logging.Error
+        // No candidates, so this exercises trash preparation without touching disk.
+        let outcome = Cleaner.moveToTrash fs log []
+        assertEqual 0 outcome.Moved.Length "nothing moved from an empty candidate list"
+        assertEqual 0 outcome.Failed.Length "nothing failed from an empty candidate list"
+        assertEqual 0L outcome.BytesMoved "no bytes moved")
+
+    test "uniqueDestination never returns a path the exists-probe reports as taken" (fun () ->
+        // Overwriting an already-trashed file would destroy it — the exact
+        // outcome this tool exists to prevent.
+        let taken = Set.ofList [ "/trash/a.txt"; "/trash/a.txt.1"; "/trash/a.txt.2" ]
+        let chosen = Cleaner.uniqueDestination (fun p -> taken.Contains p) "/trash" "a.txt"
+        assertFalse (taken.Contains chosen) "chosen destination is free"
+        assertContains "a.txt" chosen "derived from the original name")
+

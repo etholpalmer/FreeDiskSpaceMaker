@@ -107,7 +107,28 @@ let moveToTrash
           BytesMoved = 0L }
     | Ok trash ->
 
-    if not (Directory.Exists trash) then Directory.CreateDirectory trash |> ignore
+    // Creating the Trash directory can fail — a read-only home, or a
+    // permission failure on ~/.Trash. This runs after the journal was written
+    // and after the user confirmed, so an escaping exception would replace the
+    // promised summary with a stack trace. Report it as every candidate having
+    // failed, which is the truth: nothing moved.
+    let trashReady =
+        try
+            if not (Directory.Exists trash) then Directory.CreateDirectory trash |> ignore
+            Ok ()
+        with ex -> Error (sprintf "cannot prepare the Trash directory %s: %s" trash ex.Message)
+
+    match trashReady with
+    | Error message ->
+        log |> Logging.error message
+        { Moved = []
+          Failed =
+            candidates
+            |> List.map (fun c ->
+                let path = RiskEngine.candidatePath c
+                path, Types.IoFailure(path, message))
+          BytesMoved = 0L }
+    | Ok () ->
 
     let moved = ResizeArray<string>()
     let failed = ResizeArray<string * Types.FsError>()
@@ -126,8 +147,12 @@ let moveToTrash
             log |> Logging.warn (sprintf "skipping %s: changed since the scan" source)
             failed.Add(source, Types.IoFailure(source, "changed since the scan"))
         | Ok _ ->
-            let destination = uniqueDestination (fun p -> File.Exists p || Directory.Exists p) trash (Path.GetFileName source)
             try
+                // Choosing a destination probes the filesystem, so it belongs
+                // inside the guard: a permission failure here would otherwise
+                // escape and abandon the remaining candidates unreported.
+                let destination =
+                    uniqueDestination (fun p -> File.Exists p || Directory.Exists p) trash (Path.GetFileName source)
                 // Move, never delete. On a cross-device move File.Move copies
                 // then removes the source, which is still a relocation.
                 if Directory.Exists source then Directory.Move(source, destination)

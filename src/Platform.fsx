@@ -45,8 +45,25 @@ let isElevated () : bool =
             true
         with _ -> false
     | MacOS | Linux ->
-        // getuid() returns 0 for root. SUDO_USER additionally catches `sudo`.
-        Environment.GetEnvironmentVariable "USER" = "root"
+        // This is a heuristic, not a real privilege check: obtaining the
+        // effective uid would need a P/Invoke to getuid, and this project takes
+        // no native dependencies. Three independent signals are used so that
+        // defeating one is not enough.
+        //
+        // Environment.UserName is the strongest: on Unix .NET resolves it from
+        // the effective uid rather than the environment, so unlike a bare
+        // `$USER` lookup it survives `env -u USER` — verified on macOS, where
+        // it still returned the real user with USER unset.
+        //
+        // The home directory catches a root shell that has been handed a
+        // different name, and SUDO_USER catches `sudo` specifically.
+        //
+        // Even if all three are defeated, the RiskEngine denylist veto still
+        // protects /System, /Library, /Applications and /etc regardless of
+        // privilege — this check is a guard rail, not the guarantee.
+        let home = Utilities.Path.normalize (Environment.GetFolderPath Environment.SpecialFolder.UserProfile)
+        Environment.UserName = "root"
+        || home = "/var/root"
         || not (String.IsNullOrEmpty(Environment.GetEnvironmentVariable "SUDO_USER"))
 
 /// Resolves a PathSpec against the current environment.

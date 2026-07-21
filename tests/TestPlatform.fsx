@@ -124,3 +124,19 @@ let run () =
             unlock ()
             IO.Directory.Delete(root, true))
 
+    test "isElevated does not rely on the USER environment variable alone" (fun () ->
+        // A bare $USER lookup is defeated by `env -u USER`. Environment.UserName
+        // resolves from the effective uid on Unix, so it survives that. This test
+        // pins the property rather than the implementation: under a normal
+        // non-root session the answer must be false, and must stay false even
+        // when USER is absent from the environment.
+        assertFalse (isElevated ()) "a normal session is not elevated"
+        let original = Environment.GetEnvironmentVariable "USER"
+        try
+            Environment.SetEnvironmentVariable("USER", null)
+            assertFalse (isElevated ()) "still not elevated with USER unset"
+            assertTrue (Environment.UserName.Length > 0)
+                "Environment.UserName resolves without the USER variable"
+        finally
+            Environment.SetEnvironmentVariable("USER", original))
+
