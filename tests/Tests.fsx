@@ -12,6 +12,7 @@
 #load "../src/Platform.fsx"
 #load "../src/Configuration.fsx"
 #load "../src/Rules.fsx"
+#load "../src/RiskEngine.fsx"
 #load "TestFramework.fsx"
 #load "TestTypes.fsx"
 #load "TestUtilities.fsx"
@@ -19,6 +20,7 @@
 #load "TestPlatform.fsx"
 #load "TestConfiguration.fsx"
 #load "TestRules.fsx"
+#load "TestRiskEngine.fsx"
 
 TestTypes.run ()
 TestUtilities.run ()
@@ -26,5 +28,6 @@ TestDiagnostics.run ()
 TestPlatform.run ()
 TestConfiguration.run ()
 TestRules.run ()
+TestRiskEngine.run ()
 
 exit (TestFramework.report ())
