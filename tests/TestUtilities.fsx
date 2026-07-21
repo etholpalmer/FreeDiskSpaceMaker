@@ -139,3 +139,25 @@ let run () =
         assertTrue (Glob.matchesAny [ "*.tmp"; "*.log" ] "app.log") "second pattern matches"
         assertFalse (Glob.matchesAny [ "*.tmp"; "*.log" ] "app.txt") "no pattern matches"
         assertFalse (Glob.matchesAny [] "app.log") "empty pattern list matches nothing")
+
+    test "trailing newline does not defeat anchoring" (fun () ->
+        // In .NET, `$` matches at end-of-string OR immediately before a
+        // trailing `\n`, and macOS permits filenames ending in a newline.
+        // Anchors must be `\A`/`\z` so a rule for "DerivedData" does not
+        // also match a distinct entry named "DerivedData\n".
+        assertFalse (Glob.matches "DerivedData" "DerivedData\n") "literal pattern must not match with trailing newline"
+        assertFalse (Glob.matches "*.log" "app.log\n") "wildcard pattern must not match with trailing newline")
+
+    test "consecutive double star segments collapse and still match" (fun () ->
+        assertTrue (Glob.matches "**/**/*.log" "a/b/c.log") "collapsed double star matches nested path"
+        assertTrue (Glob.matches "**/**/*.log" "c.log") "collapsed double star matches zero directories")
+
+    test "chained double star patterns do not backtrack exponentially" (fun () ->
+        let longPath = [ for i in 1 .. 30 -> sprintf "seg%d" i ] |> String.concat "/"
+        let chainedPattern =
+            (String.replicate 8 "**/") + "does-not-exist.nomatch"
+        let stopwatch = System.Diagnostics.Stopwatch.StartNew()
+        let result = Glob.matches chainedPattern longPath
+        stopwatch.Stop()
+        assertFalse result "chained double star pattern does not match a non-matching path"
+        assertTrue (stopwatch.ElapsedMilliseconds < 500L) "chained double star pattern completes quickly")

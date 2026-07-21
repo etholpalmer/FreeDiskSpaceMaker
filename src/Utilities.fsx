@@ -165,40 +165,73 @@ module Glob =
     open System.Collections.Concurrent
     open System.Text.RegularExpressions
 
+    // The cache is unbounded, which is safe only because every caller passes
+    // patterns drawn from the fixed, bounded rule catalog (see Task 7's rule
+    // catalog). If patterns were ever constructed per-file (e.g. embedding a
+    // filename into a pattern string), this cache would become an unbounded
+    // memory-growth vector and would need eviction or a bounded size.
     let private cache = ConcurrentDictionary<string * bool, Regex>()
+
+    /// Regex match timeout applied to every compiled pattern. A few seconds
+    /// is ample for any legitimate glob against a filesystem path; it exists
+    /// purely as defense in depth against pathological chained `**` patterns
+    /// that could otherwise backtrack for a very long time.
+    let private matchTimeout = TimeSpan.FromSeconds 3.0
 
     /// Translates a glob pattern into an anchored regex source string.
     ///
     /// `**` crosses separators (and matches zero of them, so `**/x` matches a
-    /// bare `x`); `*` and `?` do not cross separators.
+    /// bare `x`); `*` and `?` do not cross separators. Consecutive `**`
+    /// segments (e.g. `**/**/x`) are collapsed into a single crossing group,
+    /// since they are semantically identical to one `**/` and chaining them
+    /// otherwise causes exponential backtracking against long non-matching
+    /// paths.
+    ///
+    /// Anchors are `\A` and `\z` rather than `^` and `$`: in .NET, `$` matches
+    /// at end-of-string OR immediately before a trailing `\n`, and macOS
+    /// permits filenames ending in a newline, so `^x$` would wrongly match a
+    /// file named `x\n`. `\A`/`\z` anchor to the true string boundaries.
     let private translate (pattern: string) : string =
         let sb = StringBuilder()
-        sb.Append '^' |> ignore
+        sb.Append @"\A" |> ignore
         let mutable i = 0
+        let mutable pendingDoubleStarGroup = false
+        let flushPending () =
+            if pendingDoubleStarGroup then
+                sb.Append "(?:.*[/\\\\])?" |> ignore
+                pendingDoubleStarGroup <- false
         while i < pattern.Length do
             match pattern.[i] with
             | '*' when i + 1 < pattern.Length && pattern.[i + 1] = '*' ->
                 // `**/` should also match zero directories, so consume an
                 // optional following separator as part of the same group.
+                // Consecutive `**/` runs collapse into one pending group
+                // instead of emitting a fresh group per occurrence.
                 if i + 2 < pattern.Length && (pattern.[i + 2] = '/' || pattern.[i + 2] = '\\') then
-                    sb.Append "(?:.*[/\\\\])?" |> ignore
+                    pendingDoubleStarGroup <- true
                     i <- i + 3
                 else
+                    flushPending ()
                     sb.Append ".*" |> ignore
                     i <- i + 2
             | '*' ->
+                flushPending ()
                 sb.Append "[^/\\\\]*" |> ignore
                 i <- i + 1
             | '?' ->
+                flushPending ()
                 sb.Append "[^/\\\\]" |> ignore
                 i <- i + 1
             | '/' | '\\' ->
+                flushPending ()
                 sb.Append "[/\\\\]" |> ignore
                 i <- i + 1
             | c ->
+                flushPending ()
                 sb.Append(Regex.Escape(string c)) |> ignore
                 i <- i + 1
-        sb.Append '$' |> ignore
+        flushPending ()
+        sb.Append @"\z" |> ignore
         sb.ToString()
 
     /// Compiles and caches the regex for a pattern.
@@ -208,11 +241,17 @@ module Glob =
             let options =
                 if insensitive then RegexOptions.Compiled ||| RegexOptions.IgnoreCase
                 else RegexOptions.Compiled
-            Regex(translate p, options))
+            Regex(translate p, options, matchTimeout))
 
     /// True when `path` matches `pattern`. Case sensitivity follows the platform.
+    /// A regex match timeout (defense in depth against pathological patterns)
+    /// is treated as "does not match" — a timeout must never cause a file to
+    /// be treated as matching a delete rule.
     let matches (pattern: string) (path: string) : bool =
-        (regexFor pattern).IsMatch path
+        try
+            (regexFor pattern).IsMatch path
+        with :? RegexMatchTimeoutException ->
+            false
 
     /// True when `path` matches any of the supplied patterns.
     /// An empty pattern list matches nothing.
