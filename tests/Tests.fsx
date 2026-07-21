@@ -9,13 +9,16 @@
 #load "../src/Utilities.fsx"
 #load "../src/Logging.fsx"
 #load "../src/Diagnostics.fsx"
+#load "../src/Platform.fsx"
 #load "TestFramework.fsx"
 #load "TestTypes.fsx"
 #load "TestUtilities.fsx"
 #load "TestDiagnostics.fsx"
+#load "TestPlatform.fsx"
 
 TestTypes.run ()
 TestUtilities.run ()
 TestDiagnostics.run ()
+TestPlatform.run ()
 
 exit (TestFramework.report ())
