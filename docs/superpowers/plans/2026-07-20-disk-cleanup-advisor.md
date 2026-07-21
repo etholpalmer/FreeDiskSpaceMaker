@@ -24,7 +24,94 @@ These apply to **every task**. Each task's requirements implicitly include this 
 - **Pipeline operators** (`|>`) for data flow. Active patterns where they clarify matching.
 - **Commit after every task** using Conventional Commits (`feat:`, `test:`, `fix:`, `docs:`, `refactor:`).
 - **No AI attribution trailers in commit messages.** No `Co-Authored-By: Claude`, no `Generated with`, no 🤖 lines. This is a hard project rule.
-- **`#load` order is a topologically sorted DAG.** A module may only `#load` modules defined before it in the graph. `#load` is idempotent in FSI — loading the same file twice is safe.
+- **No source or test module may contain a `#load` directive.** See the load-order rule below. This is the single most important structural constraint in the project.
+
+### The `#load` rule (verified empirically — read before writing any file)
+
+`#load` is **not** idempotent. A file reached through two separate `#load` directives is **evaluated twice**, running its top-level side effects twice. This was confirmed by direct experiment, not assumed.
+
+The consequence:
+
+> **Exactly two files in the entire project contain `#load` directives:
+> `DiskCleanupAdvisor.fsx` and `tests/Tests.fsx`.**
+> Each lists every file it needs exactly once, in topological order.
+> **No `src/*.fsx` and no `tests/Test*.fsx` may contain a `#load` line.**
+
+Modules still reference each other freely (`Scanner.make`, `Types.Safe`) — F# resolves those from the load order established by the owning file. A module does not need to `#load` a dependency in order to `open` or reference it; it only needs that dependency to appear earlier in the list.
+
+Verified behavior, for reference:
+
+| Shape | Result |
+|---|---|
+| Entry lists all files once, modules have no internal loads | ✅ Each file evaluated exactly once |
+| Entry lists a file that a dependency also loads | ❌ That file evaluated twice |
+| Two test files each loading a shared harness | ❌ Harness evaluated twice, and nested `module X =` inside a loaded file fails to resolve |
+
+A test file needs no `module` declaration — FSI names it implicitly after the filename, so `tests/TestTypes.fsx` is reachable as `TestTypes`. It must expose `run : unit -> unit`. Do **not** use an indented `module TestX =` block; that nests the name and breaks resolution.
+
+Each task's "Interfaces → Consumes" line tells you the ordering requirement; the actual `#load` goes in `tests/Tests.fsx` (and, from Task 13, `DiskCleanupAdvisor.fsx`).
+
+### Canonical load order
+
+This is the topological order. Every owner file and every throwaway probe script lists a **prefix** of this list — all entries up to and including the module it needs, skipping none.
+
+```
+src/Types.fsx
+src/Utilities.fsx
+src/Logging.fsx
+src/Diagnostics.fsx
+src/Platform.fsx
+src/Configuration.fsx
+src/Rules.fsx
+src/RiskEngine.fsx
+src/FileClassifier.fsx
+src/DirectoryWalker.fsx
+src/Scanner.fsx
+src/Hashing.fsx          (Task 14)
+src/Duplicates.fsx       (Task 14)
+src/Cleaner.fsx          (Task 15)
+src/Report/Dto.fsx
+src/Report/Json.fsx
+src/Report/Console.fsx
+src/Report/Markdown.fsx  (Task 16)
+src/Report/Html.fsx      (Task 16)
+src/Cli.fsx
+```
+
+`tests/Tests.fsx` lists this whole prefix (paths prefixed `../`), then `TestFramework.fsx`, then each `TestX.fsx` in any order.
+
+**Probe scripts in the verification steps below show only the module under test.** Replace that single line with the full prefix from this list — a probe loading just `src/RiskEngine.fsx` will fail, because `Types` and `Utilities` would not be loaded. For example, the Task 8 veto probe begins:
+
+```fsharp
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Configuration.fsx"
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Configuration.fsx"
+#load "src/Rules.fsx"
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Configuration.fsx"
+#load "src/Rules.fsx"
+#load "src/RiskEngine.fsx"
+```
 
 ### Verified environment facts
 
@@ -215,7 +302,6 @@ let report () : int =
 Create a scratch file `tests/_probe.fsx`:
 
 ```fsharp
-#load "TestFramework.fsx"
 open TestFramework
 suite "harness self-check"
 test "passing test passes" (fun () -> assertEqual 1 1 "one equals one")
@@ -234,8 +320,6 @@ Then delete the probe: `rm tests/_probe.fsx`
 Create `tests/TestTypes.fsx`:
 
 ```fsharp
-#load "TestFramework.fsx"
-#load "../src/Types.fsx"
 open TestFramework
 open Types
 
@@ -265,9 +349,13 @@ Create `tests/Tests.fsx`:
 
 ```fsharp
 (**
-    Test entry point. Loads every test module and runs it.
+    Test entry point, and one of only two files in the project permitted to
+    contain #load directives. Lists every file exactly once in topological
+    order — see the Canonical load order in the plan header.
+
     Run with:  dotnet fsi tests/Tests.fsx
 *)
+#load "../src/Types.fsx"
 #load "TestFramework.fsx"
 #load "TestTypes.fsx"
 
@@ -551,8 +639,6 @@ PathSpec, Category, FsError, FileMeta."
 Create `tests/TestUtilities.fsx`:
 
 ```fsharp
-#load "TestFramework.fsx"
-#load "../src/Utilities.fsx"
 open System
 open TestFramework
 open Utilities
@@ -631,9 +717,11 @@ Modify `tests/Tests.fsx` to read:
 
 ```fsharp
 (**
-    Test entry point. Loads every test module and runs it.
+    Test entry point. Every file listed exactly once, in topological order.
     Run with:  dotnet fsi tests/Tests.fsx
 *)
+#load "../src/Types.fsx"
+#load "../src/Utilities.fsx"
 #load "TestFramework.fsx"
 #load "TestTypes.fsx"
 #load "TestUtilities.fsx"
@@ -991,8 +1079,6 @@ directories; * and ? stop at a separator."
 Create `tests/TestDiagnostics.fsx`:
 
 ```fsharp
-#load "TestFramework.fsx"
-#load "../src/Diagnostics.fsx"
 open System
 open TestFramework
 open Diagnostics
@@ -1164,7 +1250,6 @@ open System
 open System.Diagnostics
 open System.Threading
 
-#load "Utilities.fsx"
 open Utilities
 
 /// Why a directory or file was not examined.
@@ -1282,6 +1367,8 @@ Run:
 
 ```bash
 cat > /tmp/logprobe.fsx <<'EOF'
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
 #load "src/Logging.fsx"
 let log = Logging.create Logging.Debug
 log |> Logging.debug "a debug line"
@@ -1343,8 +1430,6 @@ are incremented once per filesystem entry across threads."
 Create `tests/TestPlatform.fsx`:
 
 ```fsharp
-#load "TestFramework.fsx"
-#load "../src/Platform.fsx"
 open System
 open TestFramework
 open Types
@@ -1415,7 +1500,7 @@ let run () =
 
 - [ ] **Step 2: Wire into the test entry point**
 
-Modify `tests/Tests.fsx` — add `#load "TestPlatform.fsx"` and `TestPlatform.run ()`.
+Modify `tests/Tests.fsx` — add the new source module and its test to the load list, keeping Canonical load order, then add `TestPlatform.run ()` before the `exit` line. Source `#load`s come first, then `TestFramework.fsx`, then `#load "TestPlatform.fsx"`.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
@@ -1447,8 +1532,6 @@ open System
 open System.IO
 open System.Runtime.InteropServices
 
-#load "Types.fsx"
-#load "Utilities.fsx"
 open Types
 open Utilities
 
@@ -1695,8 +1778,6 @@ partially-readable directory still yields its readable entries."
 Create `tests/TestConfiguration.fsx`:
 
 ```fsharp
-#load "TestFramework.fsx"
-#load "../src/Configuration.fsx"
 open TestFramework
 open Types
 open Configuration
@@ -1773,7 +1854,7 @@ Note: the *lowering* rejection is enforced in `RiskEngine` (Task 8), because onl
 
 - [ ] **Step 2: Wire into the test entry point**
 
-Modify `tests/Tests.fsx` — add `#load "TestConfiguration.fsx"` and `TestConfiguration.run ()`.
+Modify `tests/Tests.fsx` — add the new source module and its test to the load list, keeping Canonical load order, then add `TestConfiguration.run ()` before the `exit` line. Source `#load`s come first, then `TestFramework.fsx`, then `#load "TestConfiguration.fsx"`.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
@@ -1801,9 +1882,6 @@ module Configuration
 open System
 open System.Text.Json
 
-#load "Types.fsx"
-#load "Utilities.fsx"
-#load "Platform.fsx"
 open Types
 open Utilities
 
@@ -2010,6 +2088,11 @@ Expected: PASS — 49 tests total.
 
 ```bash
 cat > /tmp/cfgprobe.fsx <<'EOF'
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
 #load "src/Configuration.fsx"
 match Configuration.parse """{"minSizeBytes": -1, "threadCount": 0, "hashAlgorithm": "crc32"}""" with
 | Ok _ -> printfn "UNEXPECTED: should have failed"
@@ -2057,8 +2140,6 @@ validation error is reported at once so users fix them in one pass."
 Create `tests/TestRules.fsx`:
 
 ```fsharp
-#load "TestFramework.fsx"
-#load "../src/Rules.fsx"
 open System
 open TestFramework
 open Types
@@ -2139,7 +2220,7 @@ let run () =
 
 - [ ] **Step 2: Wire into the test entry point**
 
-Modify `tests/Tests.fsx` — add `#load "TestRules.fsx"` and `TestRules.run ()`.
+Modify `tests/Tests.fsx` — add the new source module and its test to the load list, keeping Canonical load order, then add `TestRules.run ()` before the `exit` line. Source `#load`s come first, then `TestFramework.fsx`, then `#load "TestRules.fsx"`.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
@@ -2169,9 +2250,6 @@ module Rules
 
 open System
 
-#load "Types.fsx"
-#load "Utilities.fsx"
-#load "Platform.fsx"
 open Types
 open Utilities
 
@@ -2603,6 +2681,12 @@ Expected: PASS — 58 tests total.
 
 ```bash
 cat > /tmp/ruleprobe.fsx <<'EOF'
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Configuration.fsx"
 #load "src/Rules.fsx"
 let fs = Platform.FileSystem.real
 let resolved = Rules.resolveAll fs (Platform.current ())
@@ -2656,8 +2740,6 @@ lets the Containers cache rule outrank the Containers catch-all."
 Create `tests/TestRiskEngine.fsx`. These tests are the safety guarantee — write them before any implementation.
 
 ```fsharp
-#load "TestFramework.fsx"
-#load "../src/RiskEngine.fsx"
 open System
 open TestFramework
 open Types
@@ -2838,7 +2920,7 @@ let run () =
 
 - [ ] **Step 2: Wire into the test entry point**
 
-Modify `tests/Tests.fsx` — add `#load "TestRiskEngine.fsx"` and `TestRiskEngine.run ()`.
+Modify `tests/Tests.fsx` — add the new source module and its test to the load list, keeping Canonical load order, then add `TestRiskEngine.run ()` before the `exit` line. Source `#load`s come first, then `TestFramework.fsx`, then `#load "TestRiskEngine.fsx"`.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
@@ -2876,10 +2958,6 @@ module RiskEngine
 
 open System
 
-#load "Types.fsx"
-#load "Utilities.fsx"
-#load "Platform.fsx"
-#load "Rules.fsx"
 open Types
 open Utilities
 open Rules
@@ -3073,6 +3151,13 @@ Every one of the 21 RiskEngine tests must pass. **If any gate test fails, stop a
 This confirms the structural guarantee rather than trusting it. Create `/tmp/ctorprobe.fsx`:
 
 ```fsharp
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Configuration.fsx"
+#load "src/Rules.fsx"
 #load "src/RiskEngine.fsx"
 open RiskEngine
 // This must NOT compile. If it does, the structural guarantee is broken.
@@ -3092,6 +3177,13 @@ Clean up: `rm /tmp/ctorprobe.fsx`
 
 ```bash
 cat > /tmp/vetoprobe.fsx <<'EOF'
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Configuration.fsx"
+#load "src/Rules.fsx"
 #load "src/RiskEngine.fsx"
 let home = Platform.home ()
 let cases =
@@ -3156,8 +3248,6 @@ than a silent clamp."
 Create `tests/TestDto.fsx`:
 
 ```fsharp
-#load "TestFramework.fsx"
-#load "../src/Report/Dto.fsx"
 open System.Text.Json
 open TestFramework
 open Dto
@@ -3217,7 +3307,7 @@ let run () =
 
 - [ ] **Step 2: Wire into the test entry point**
 
-Modify `tests/Tests.fsx` — add `#load "TestDto.fsx"` and `TestDto.run ()`.
+Modify `tests/Tests.fsx` — add the new source module and its test to the load list, keeping Canonical load order, then add `TestDto.run ()` before the `exit` line. Source `#load`s come first, then `TestFramework.fsx`, then `#load "TestDto.fsx"`.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
@@ -3338,8 +3428,6 @@ No DTO field may be a DU; the serialization test is the guard."
 Create `tests/TestFileClassifier.fsx`:
 
 ```fsharp
-#load "TestFramework.fsx"
-#load "../src/FileClassifier.fsx"
 open TestFramework
 open Types
 open FileClassifier
@@ -3397,7 +3485,7 @@ let run () =
 
 - [ ] **Step 2: Wire into the test entry point**
 
-Modify `tests/Tests.fsx` — add `#load "TestFileClassifier.fsx"` and `TestFileClassifier.run ()`.
+Modify `tests/Tests.fsx` — add the new source module and its test to the load list, keeping Canonical load order, then add `TestFileClassifier.run ()` before the `exit` line. Source `#load`s come first, then `TestFramework.fsx`, then `#load "TestFileClassifier.fsx"`.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
@@ -3425,8 +3513,6 @@ module FileClassifier
 
 open System
 
-#load "Types.fsx"
-#load "Utilities.fsx"
 open Types
 open Utilities
 
@@ -3540,8 +3626,6 @@ is presentation only and has no bearing on deletability."
 Create `tests/TestDirectoryWalker.fsx`:
 
 ```fsharp
-#load "TestFramework.fsx"
-#load "../src/DirectoryWalker.fsx"
 open TestFramework
 open Types
 open Platform
@@ -3621,7 +3705,7 @@ let run () =
 
 - [ ] **Step 2: Wire into the test entry point**
 
-Modify `tests/Tests.fsx` — add `#load "TestDirectoryWalker.fsx"` and `TestDirectoryWalker.run ()`.
+Modify `tests/Tests.fsx` — add the new source module and its test to the load list, keeping Canonical load order, then add `TestDirectoryWalker.run ()` before the `exit` line. Source `#load`s come first, then `TestFramework.fsx`, then `#load "TestDirectoryWalker.fsx"`.
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
@@ -3656,11 +3740,6 @@ module DirectoryWalker
 open System
 open System.Collections.Generic
 
-#load "Types.fsx"
-#load "Utilities.fsx"
-#load "Logging.fsx"
-#load "Diagnostics.fsx"
-#load "Platform.fsx"
 open Types
 open Utilities
 
@@ -3793,6 +3872,15 @@ Expected: PASS — 101 tests total.
 
 ```bash
 cat > /tmp/walkprobe.fsx <<'EOF'
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Configuration.fsx"
+#load "src/Rules.fsx"
+#load "src/RiskEngine.fsx"
+#load "src/FileClassifier.fsx"
 #load "src/DirectoryWalker.fsx"
 let fs = Platform.FileSystem.real
 let counters = Diagnostics.create ()
@@ -3821,4 +3909,1062 @@ overflow."
 
 ---
 
-**Remaining tasks (12–17) follow in the next section of this plan.**
+### Task 12: Scanner
+
+**Files:**
+- Create: `src/Scanner.fsx`
+- Create: `tests/TestScanner.fsx`
+- Modify: `tests/Tests.fsx`
+
+**Interfaces:**
+- Consumes: `Types`, `Utilities`, `Platform`, `Rules`, `RiskEngine`, `FileClassifier`, `DirectoryWalker`, `Configuration`, `Diagnostics`
+- Produces:
+  - `Scanner.Finding` = `{ Meta: FileMeta; RuleName: string; Category: Category; Risk: RiskLevel; Recoverability: Recoverability; Strategy: DeleteStrategy; Reason: string; Candidate: RiskEngine.DeletionCandidate option }`
+  - `Scanner.ScanResult` = `{ GeneratedAtUtc: DateTime; Platform: Types.Platform; ScanRoots: string list; Findings: Finding list; Errors: FsError list; Elapsed: TimeSpan; Counters: Diagnostics.Snapshot }`
+  - `Scanner.scan : FileSystemOps -> Config -> allowProbablySafe: bool -> ResolvedRule list -> Result<ScanResult, string list>`
+  - `Scanner.reclaimableBytes : ScanResult -> int64`
+  - `Scanner.pendingReviewBytes : ScanResult -> int64`
+  - `Scanner.byCategory : ScanResult -> (Category * Finding list) list`
+
+**Key behavior:** a file is matched against rules **in precedence order**, and the **first** match wins. This is what makes the Containers requirement work — the narrow cache rule is checked before the broad catch-all.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/TestScanner.fsx`:
+
+```fsharp
+open System
+open TestFramework
+open Types
+open Platform
+open Scanner
+
+/// A minimal rule builder for tests.
+let private testRule name root risk safeToDelete includes =
+    { Rules.Name = name
+      Rules.Platforms = Set.ofList [ MacOS; Linux; Windows ]
+      Rules.Root = Absolute root
+      Rules.Include = includes
+      Rules.Exclude = []
+      Rules.Risk = risk
+      Rules.Recoverability = Regenerated
+      Rules.Strategy = ContentsOnly
+      Rules.MinAge = None
+      Rules.MinSize = None
+      Rules.SafeToDelete = safeToDelete
+      Rules.Description = "test rule"
+      Rules.Reason = "test reason"
+      Rules.EstimatedBenefit = "test"
+      Rules.Examples = [ root ]
+      Rules.Category = Caches }
+
+let private tree =
+    [ { Path = "/cache"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+      { Path = "/cache/a.tmp"; SizeBytes = 1000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
+      { Path = "/cache/b.tmp"; SizeBytes = 2000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 60.0 }
+      { Path = "/data"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+      { Path = "/data/keep.txt"; SizeBytes = 3000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 } ]
+
+let run () =
+    suite "Scanner"
+
+    let fs = FileSystem.inMemory tree
+    let config = Configuration.defaults
+
+    test "a Safe rule produces findings with deletion candidates" (fun () ->
+        let rules = [ { Rules.Rule = testRule "Cache" "/cache" Safe true []; Rules.Root = "/cache" } ]
+        let result = assertOk (scan fs config false rules) "scan succeeds"
+        assertEqual 2 result.Findings.Length "two cache files found"
+        assertTrue (result.Findings |> List.forall (fun f -> f.Candidate.IsSome)) "all have candidates")
+
+    test "a Review rule produces findings with no candidates" (fun () ->
+        let rules = [ { Rules.Rule = testRule "Data" "/data" Review false []; Rules.Root = "/data" } ]
+        let result = assertOk (scan fs config false rules) "scan succeeds"
+        assertEqual 1 result.Findings.Length "one file found"
+        assertEqual None (List.head result.Findings).Candidate "no candidate for a Review rule")
+
+    test "reclaimable and pending-review bytes are reported separately" (fun () ->
+        // Conflating these would let a user believe space was freed when it
+        // had only been listed for review.
+        let rules =
+            [ { Rules.Rule = testRule "Cache" "/cache" Safe true []; Rules.Root = "/cache" }
+              { Rules.Rule = testRule "Data" "/data" Review false []; Rules.Root = "/data" } ]
+        let result = assertOk (scan fs config false rules) "scan succeeds"
+        assertEqual 3000L (reclaimableBytes result) "cache bytes are reclaimable"
+        assertEqual 3000L (pendingReviewBytes result) "data bytes are pending review")
+
+    test "the first rule in precedence order wins" (fun () ->
+        // This is the Containers requirement: a narrow Safe rule must beat a
+        // broad Review catch-all covering the same path.
+        let narrow = { Rules.Rule = testRule "Narrow" "/cache" Safe true []; Rules.Root = "/cache" }
+        let broad = { Rules.Rule = testRule "Broad" "/" Review false []; Rules.Root = "/" }
+        let ordered = Rules.byPrecedence [ broad; narrow ]
+        let result = assertOk (scan fs config false ordered) "scan succeeds"
+        let cacheFinding = result.Findings |> List.find (fun f -> f.Meta.Path = "/cache/a.tmp")
+        assertEqual "Narrow" cacheFinding.RuleName "the more specific rule matched")
+
+    test "MinAge excludes items younger than the threshold" (fun () ->
+        let aged = { testRule "Cache" "/cache" Safe true [] with Rules.MinAge = Some (TimeSpan.FromDays 30.0) }
+        let rules = [ { Rules.Rule = aged; Rules.Root = "/cache" } ]
+        let result = assertOk (scan fs config false rules) "scan succeeds"
+        assertEqual 1 result.Findings.Length "only the 60-day-old file qualifies"
+        assertEqual "/cache/b.tmp" (List.head result.Findings).Meta.Path "the older file")
+
+    test "MinSize excludes items below the threshold" (fun () ->
+        let sized = { testRule "Cache" "/cache" Safe true [] with Rules.MinSize = Some 1500L }
+        let rules = [ { Rules.Rule = sized; Rules.Root = "/cache" } ]
+        let result = assertOk (scan fs config false rules) "scan succeeds"
+        assertEqual 1 result.Findings.Length "only the 2000-byte file qualifies")
+
+    test "include globs restrict what a rule matches" (fun () ->
+        let rules = [ { Rules.Rule = testRule "Cache" "/cache" Safe true [ "*.nomatch" ]; Rules.Root = "/cache" } ]
+        let result = assertOk (scan fs config false rules) "scan succeeds"
+        assertEqual 0 result.Findings.Length "no file matches the include glob")
+
+    test "ignored extensions from config are excluded" (fun () ->
+        let rules = [ { Rules.Rule = testRule "Cache" "/cache" Safe true []; Rules.Root = "/cache" } ]
+        let withIgnore = { config with IgnoreExtensions = [ ".tmp" ] }
+        let result = assertOk (scan fs withIgnore false rules) "scan succeeds"
+        assertEqual 0 result.Findings.Length "tmp files excluded by config")
+
+    test "a lowering risk override aborts the scan with an error" (fun () ->
+        let rules = [ { Rules.Rule = testRule "Data" "/data" Review false []; Rules.Root = "/data" } ]
+        let bad = { config with RiskOverrides = Map.ofList [ "Data", Safe ] }
+        let errors = assertError (scan fs bad false rules) "lowering override rejected"
+        assertContains "lower" ((List.head errors).ToLowerInvariant()) "explains the direction")
+
+    test "byCategory groups findings and drops empty categories" (fun () ->
+        let rules = [ { Rules.Rule = testRule "Cache" "/cache" Safe true []; Rules.Root = "/cache" } ]
+        let result = assertOk (scan fs config false rules) "scan succeeds"
+        let grouped = byCategory result
+        assertEqual 1 grouped.Length "one non-empty category"
+        assertEqual 2 (snd (List.head grouped)).Length "two findings in it")
+
+    test "walk errors are carried into the result" (fun () ->
+        let denying = { fs with EnumerateFiles = fun p -> Error (PermissionDenied p) }
+        let rules = [ { Rules.Rule = testRule "Cache" "/cache" Safe true []; Rules.Root = "/cache" } ]
+        let result = assertOk (scan denying config false rules) "scan still succeeds"
+        assertTrue (result.Errors.Length > 0) "errors reported"
+        assertEqual 0 result.Findings.Length "no findings from an unreadable tree")
+```
+
+- [ ] **Step 2: Wire into the test entry point**
+
+Modify `tests/Tests.fsx` — add the new source module and its test to the load list, keeping Canonical load order, then add `TestScanner.run ()` before the `exit` line. Source `#load`s come first, then `TestFramework.fsx`, then `#load "TestScanner.fsx"`.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: FAIL — cannot find `../src/Scanner.fsx`.
+
+- [ ] **Step 4: Write Scanner.fsx**
+
+Create `src/Scanner.fsx`:
+
+```fsharp
+(**
+    Assembles a scan: walk each rule root, match files against rules in
+    precedence order, and ask the risk engine whether each match may be removed.
+
+    The scanner contains **no rule-specific logic**. It is parameterized over a
+    resolved rule list, so adding a rule to the catalog changes nothing here.
+
+    First match wins. Because rules arrive sorted most-specific-first, a narrow
+    rule inside a broad one takes precedence — which is exactly what makes the
+    ~/Library/Containers requirement work: the cache rule is checked before the
+    catch-all, so only Data/Library/Caches and Data/tmp come back Safe.
+*)
+module Scanner
+
+open System
+
+open Types
+open Utilities
+
+/// One reported item, with its deletion candidate when it passed all gates.
+type Finding =
+    { Meta: FileMeta
+      RuleName: string
+      Category: Category
+      Risk: RiskLevel
+      Recoverability: Recoverability
+      Strategy: DeleteStrategy
+      Reason: string
+      /// Present only when all three risk gates passed. `None` means the item
+      /// is reported but may not be removed.
+      Candidate: RiskEngine.DeletionCandidate option }
+
+/// A complete scan.
+type ScanResult =
+    { GeneratedAtUtc: DateTime
+      Platform: Types.Platform
+      ScanRoots: string list
+      Findings: Finding list
+      Errors: FsError list
+      Elapsed: TimeSpan
+      Counters: Diagnostics.Snapshot }
+
+/// True when a file satisfies a rule's include globs, exclude globs, age
+/// floor, and size floor.
+let private satisfies (now: DateTime) (root: string) (rule: Rules.Rule) (meta: FileMeta) : bool =
+    // Globs are matched against the path relative to the rule root, so a rule
+    // does not have to know where it was resolved to.
+    let relative =
+        let normalizedRoot = Utilities.Path.normalize root
+        let normalizedPath = Utilities.Path.normalize meta.Path
+        if normalizedPath.Length > normalizedRoot.Length + 1
+        then normalizedPath.Substring(normalizedRoot.Length + 1)
+        else normalizedPath
+
+    let includeOk =
+        List.isEmpty rule.Include || Utilities.Glob.matchesAny rule.Include relative
+
+    let excludeOk =
+        List.isEmpty rule.Exclude || not (Utilities.Glob.matchesAny rule.Exclude relative)
+
+    let ageOk =
+        match rule.MinAge with
+        | None -> true
+        | Some minimum -> FileMeta.age now meta >= minimum
+
+    let sizeOk =
+        match rule.MinSize with
+        | None -> true
+        | Some minimum -> meta.SizeBytes >= minimum
+
+    includeOk && excludeOk && ageOk && sizeOk
+
+/// Finds the first rule in precedence order that claims this file.
+let private firstMatch
+    (now: DateTime)
+    (rules: Rules.ResolvedRule list)
+    (meta: FileMeta)
+    : Rules.ResolvedRule option =
+    rules
+    |> List.tryFind (fun resolved ->
+        Utilities.Path.isDescendantOf resolved.Root meta.Path
+        && satisfies now resolved.Root resolved.Rule meta)
+
+/// Runs a scan over every resolved rule root.
+///
+/// `allowProbablySafe` corresponds to --force and widens only the risk gate.
+/// Returns Error when configuration overrides are invalid, because continuing
+/// would apply a risk policy the user did not actually get.
+let scan
+    (fs: Platform.FileSystemOps)
+    (config: Configuration.Config)
+    (allowProbablySafe: bool)
+    (rules: Rules.ResolvedRule list)
+    : Result<ScanResult, string list> =
+
+    // Apply configuration overrides first. A lowering override is fatal.
+    let overrideResults =
+        rules
+        |> List.map (fun resolved ->
+            RiskEngine.applyOverrides config.RiskOverrides resolved.Rule
+            |> Result.map (fun updated -> { resolved with Rules.Rule = updated }))
+
+    let overrideErrors =
+        overrideResults |> List.choose (function Error e -> Some e | Ok _ -> None)
+
+    if not (List.isEmpty overrideErrors) then Error overrideErrors
+    else
+
+    let effectiveRules =
+        overrideResults |> List.choose (function Ok r -> Some r | Error _ -> None)
+
+    let now = DateTime.UtcNow
+    let counters = Diagnostics.create ()
+    let walkOptions =
+        { DirectoryWalker.defaultOptions with
+            DirectoryWalker.MaxDepth = 32
+            DirectoryWalker.ThreadCount = config.ThreadCount
+            DirectoryWalker.IgnorePaths = config.IgnorePaths }
+
+    // Distinct roots, so two rules sharing a root do not walk it twice.
+    let roots =
+        effectiveRules
+        |> List.map (fun r -> r.Root)
+        |> List.distinct
+
+    let outcomes = roots |> List.map (DirectoryWalker.walk fs counters walkOptions)
+
+    let allFiles = outcomes |> List.collect (fun o -> o.Files)
+    let allErrors = outcomes |> List.collect (fun o -> o.Errors)
+
+    let ignoredExtension (path: string) =
+        let lower = path.ToLowerInvariant()
+        config.IgnoreExtensions |> List.exists (fun e -> lower.EndsWith(e, StringComparison.Ordinal))
+
+    let findings =
+        allFiles
+        |> List.filter (fun meta -> not (ignoredExtension meta.Path))
+        |> List.choose (fun meta ->
+            match firstMatch now effectiveRules meta with
+            | None -> None
+            | Some resolved ->
+                let rule = resolved.Rule
+                // The risk engine is the sole authority on deletability. A
+                // rejection here is normal, not an error: most findings are
+                // reported without being removable.
+                let candidate =
+                    match RiskEngine.evaluate allowProbablySafe resolved meta with
+                    | Ok c -> Some c
+                    | Error _ -> None
+                Some
+                    { Meta = meta
+                      RuleName = rule.Name
+                      Category = rule.Category
+                      Risk = rule.Risk
+                      Recoverability = rule.Recoverability
+                      Strategy = rule.Strategy
+                      Reason = rule.Reason
+                      Candidate = candidate })
+
+    Ok
+        { GeneratedAtUtc = now
+          Platform = Platform.current ()
+          ScanRoots = roots
+          Findings = findings
+          Errors = allErrors
+          Elapsed = counters.Clock.Elapsed
+          Counters = Diagnostics.snapshot counters }
+
+/// Total bytes that passed every gate and could be moved to Trash.
+let reclaimableBytes (result: ScanResult) : int64 =
+    result.Findings
+    |> List.filter (fun f -> f.Candidate.IsSome)
+    |> List.sumBy (fun f -> f.Meta.SizeBytes)
+
+/// Total bytes reported for human judgment but not automatically removable.
+/// Deliberately distinct from `reclaimableBytes` — see the report modules,
+/// which must never present the two as one number.
+let pendingReviewBytes (result: ScanResult) : int64 =
+    result.Findings
+    |> List.filter (fun f -> f.Candidate.IsNone)
+    |> List.sumBy (fun f -> f.Meta.SizeBytes)
+
+/// Groups findings by category, largest total first, dropping empty categories.
+let byCategory (result: ScanResult) : (Category * Finding list) list =
+    result.Findings
+    |> List.groupBy (fun f -> f.Category)
+    |> List.sortByDescending (fun (_, findings) -> findings |> List.sumBy (fun f -> f.Meta.SizeBytes))
+
+/// The count of directories that could not be read, for the Full Disk Access hint.
+let unreadableDirectoryCount (result: ScanResult) : int =
+    result.Errors
+    |> List.filter (function PermissionDenied _ -> true | _ -> false)
+    |> List.length
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: PASS — 112 tests total.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/Scanner.fsx tests/TestScanner.fsx tests/Tests.fsx
+git commit -m "feat: add scanner assembling walk, rules, and risk gates
+
+First match wins over a precedence-sorted rule list, which is what
+makes a narrow rule inside a broad one take effect. The scanner holds
+no rule-specific logic. Reclaimable and pending-review bytes are
+computed separately and must stay that way in reports."
+```
+
+---
+
+### Task 13: Console report, JSON report, CLI, and entry point
+
+**This task produces the first end-to-end usable version.** After it, `dotnet fsi DiskCleanupAdvisor.fsx` performs a real scan and prints a real report. Nothing can be deleted yet — `Cleaner` does not exist until Task 15.
+
+**Files:**
+- Create: `src/Report/Console.fsx`
+- Create: `src/Report/Json.fsx`
+- Create: `src/Cli.fsx`
+- Create: `DiskCleanupAdvisor.fsx`
+- Create: `tests/TestCli.fsx`
+- Modify: `tests/Tests.fsx`
+
+**Interfaces:**
+- Consumes: everything through `Scanner`, plus `Dto`
+- Produces:
+  - `Cli.Options` = `{ Mode: Mode; JsonPath: string option; MarkdownPath: string option; HtmlPath: string option; ConfigPath: string option; Duplicates: bool; LargeFiles: bool; AgeDays: int option; MinSizeBytes: int64 option; Threads: int option; HashAlgorithm: string option; Force: bool; AllowRoot: bool; Verbose: bool }`
+  - `Cli.Mode` = `Scan | Delete | Help`
+  - `Cli.parse : string list -> Result<Options, string list>`
+  - `Cli.helpText : string`
+  - `Report.Console.render : ScanResult -> string`
+  - `Report.Json.write : string -> ScanResult -> Result<unit, string>`
+  - `Report.Json.toDto : ScanResult -> Dto.ScanResultDto`
+
+- [ ] **Step 1: Write the failing CLI tests**
+
+Create `tests/TestCli.fsx`:
+
+```fsharp
+open TestFramework
+open Cli
+
+let run () =
+    suite "Cli.parse"
+
+    test "no arguments defaults to scan mode" (fun () ->
+        // Dry run is the default and requires no flag. Running the tool with
+        // no arguments must never be able to modify anything.
+        let options = assertOk (parse []) "empty argument list"
+        assertEqual Scan options.Mode "scan is the default"
+        assertFalse options.Force "force is off by default")
+
+    test "--scan selects scan mode" (fun () ->
+        assertEqual Scan (assertOk (parse [ "--scan" ]) "scan flag").Mode "scan mode")
+
+    test "--delete selects delete mode" (fun () ->
+        assertEqual Delete (assertOk (parse [ "--delete" ]) "delete flag").Mode "delete mode")
+
+    test "--dry-run forces scan mode even alongside --delete" (fun () ->
+        // An explicit dry-run request must win over a delete request; the
+        // safer interpretation of a contradictory command line is the correct one.
+        let options = assertOk (parse [ "--delete"; "--dry-run" ]) "contradictory flags"
+        assertEqual Scan options.Mode "dry-run wins")
+
+    test "--help selects help mode" (fun () ->
+        assertEqual Help (assertOk (parse [ "--help" ]) "help flag").Mode "help mode")
+
+    test "report paths are captured" (fun () ->
+        let options = assertOk (parse [ "--json"; "/tmp/r.json"; "--html"; "/tmp/r.html" ]) "report paths"
+        assertEqual (Some "/tmp/r.json") options.JsonPath "json path"
+        assertEqual (Some "/tmp/r.html") options.HtmlPath "html path"
+        assertEqual None options.MarkdownPath "markdown not requested")
+
+    test "numeric options are parsed" (fun () ->
+        let options = assertOk (parse [ "--age"; "60"; "--min-size"; "2048"; "--threads"; "4" ]) "numeric options"
+        assertEqual (Some 60) options.AgeDays "age"
+        assertEqual (Some 2048L) options.MinSizeBytes "min size"
+        assertEqual (Some 4) options.Threads "threads")
+
+    test "boolean flags are captured" (fun () ->
+        let options = assertOk (parse [ "--duplicates"; "--large-files"; "--verbose"; "--force" ]) "boolean flags"
+        assertTrue options.Duplicates "duplicates"
+        assertTrue options.LargeFiles "large files"
+        assertTrue options.Verbose "verbose"
+        assertTrue options.Force "force")
+
+    test "an unknown flag is an error naming the flag" (fun () ->
+        let errors = assertError (parse [ "--nonsense" ]) "unknown flag"
+        assertContains "--nonsense" (List.head errors) "names the flag")
+
+    test "a flag missing its value is an error" (fun () ->
+        let errors = assertError (parse [ "--json" ]) "missing value"
+        assertContains "--json" (List.head errors) "names the flag"
+        assertContains "value" (List.head errors) "explains what is missing")
+
+    test "a non-numeric value for a numeric flag is an error" (fun () ->
+        let errors = assertError (parse [ "--threads"; "many" ]) "bad number"
+        assertContains "many" (List.head errors) "names the offending value")
+
+    test "every error is reported at once" (fun () ->
+        let errors = assertError (parse [ "--nonsense"; "--threads"; "many" ]) "two problems"
+        assertEqual 2 errors.Length "both errors reported")
+
+    test "help text documents every supported flag" (fun () ->
+        for flag in [ "--scan"; "--delete"; "--force"; "--dry-run"; "--json"; "--markdown"
+                      "--html"; "--duplicates"; "--large-files"; "--age"; "--min-size"
+                      "--threads"; "--hash-algorithm"; "--config"; "--allow-root"; "--verbose"; "--help" ] do
+            assertContains flag helpText (sprintf "%s is documented" flag))
+```
+
+- [ ] **Step 2: Wire into the test entry point**
+
+Modify `tests/Tests.fsx` — add the new source module and its test to the load list, keeping Canonical load order, then add `TestCli.run ()` before the `exit` line. Source `#load`s come first, then `TestFramework.fsx`, then `#load "TestCli.fsx"`.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: FAIL — cannot find `../src/Cli.fsx`.
+
+- [ ] **Step 4: Write Cli.fsx**
+
+Create `src/Cli.fsx`:
+
+```fsharp
+(**
+    Command-line parsing.
+
+    Hand-rolled rather than taking a dependency: the surface is small and the
+    project forbids third-party packages.
+
+    Two safety properties are enforced here. Scan is the default mode, so
+    invoking the tool with no arguments cannot modify anything. And --dry-run
+    overrides --delete, so the safer reading of a contradictory command line
+    always wins.
+
+    Errors accumulate: a command line with three mistakes reports all three.
+*)
+module Cli
+
+open System
+
+/// What the tool was asked to do.
+type Mode =
+    | Scan
+    | Delete
+    | Help
+
+/// Parsed command-line options.
+type Options =
+    { Mode: Mode
+      JsonPath: string option
+      MarkdownPath: string option
+      HtmlPath: string option
+      ConfigPath: string option
+      Duplicates: bool
+      LargeFiles: bool
+      AgeDays: int option
+      MinSizeBytes: int64 option
+      Threads: int option
+      HashAlgorithm: string option
+      /// Widens the risk gate to include ProbablySafe. Never bypasses the veto.
+      Force: bool
+      AllowRoot: bool
+      Verbose: bool }
+
+/// Options with nothing requested: a plain dry-run scan.
+let private empty: Options =
+    { Mode = Scan
+      JsonPath = None
+      MarkdownPath = None
+      HtmlPath = None
+      ConfigPath = None
+      Duplicates = false
+      LargeFiles = false
+      AgeDays = None
+      MinSizeBytes = None
+      Threads = None
+      HashAlgorithm = None
+      Force = false
+      AllowRoot = false
+      Verbose = false }
+
+/// Usage text. Every flag the parser accepts must appear here; a test enforces it.
+let helpText =
+    """DiskCleanupAdvisor — find and safely reclaim disk space
+
+USAGE
+    dotnet fsi DiskCleanupAdvisor.fsx [options]
+
+MODES
+    --scan                  Scan and report. This is the default.
+    --delete                Move Safe-rated items to Trash, after confirmation.
+    --dry-run               Force scan mode. Overrides --delete.
+    --help                  Show this text.
+
+REPORTS
+    --json <path>           Write a JSON report.
+    --markdown <path>       Write a Markdown report.
+    --html <path>           Write a self-contained HTML report.
+
+SCAN OPTIONS
+    --duplicates            Detect duplicate files.
+    --large-files           Report the largest files.
+    --age <days>            Only consider items older than this.
+    --min-size <bytes>      Size floor for hashing and large-file reporting.
+    --threads <n>           Traversal parallelism.
+    --hash-algorithm <alg>  sha256 (default) or md5.
+    --config <path>         Configuration file.
+
+SAFETY
+    --force                 Also permit ProbablySafe items. Never bypasses the
+                            protected-path veto, which has no override.
+    --allow-root            Permit running with elevated privileges.
+    --verbose               Debug logging to stderr.
+
+NOTES
+    Nothing is deleted without --delete and an interactive confirmation.
+    Deletion moves items to the Trash; it never unlinks. Space is reclaimed
+    only when you empty the Trash yourself."""
+
+/// Parses arguments, accumulating every error.
+let parse (args: string list) : Result<Options, string list> =
+    let errors = ResizeArray<string>()
+
+    /// Reads the value following a flag, recording an error when absent.
+    let readValue (flag: string) (rest: string list) : string option * string list =
+        match rest with
+        | value :: remaining when not (value.StartsWith "--") -> Some value, remaining
+        | _ ->
+            errors.Add(sprintf "%s requires a value" flag)
+            None, rest
+
+    let parseInt (flag: string) (text: string) : int option =
+        match Int32.TryParse text with
+        | true, n -> Some n
+        | _ ->
+            errors.Add(sprintf "%s expects a number, got '%s'" flag text)
+            None
+
+    let parseInt64 (flag: string) (text: string) : int64 option =
+        match Int64.TryParse text with
+        | true, n -> Some n
+        | _ ->
+            errors.Add(sprintf "%s expects a number, got '%s'" flag text)
+            None
+
+    // Tracked separately so --dry-run can override --delete regardless of order.
+    let mutable explicitDryRun = false
+
+    let rec loop (options: Options) (remaining: string list) : Options =
+        match remaining with
+        | [] -> options
+        | flag :: rest ->
+            match flag with
+            | "--scan" -> loop { options with Mode = Scan } rest
+            | "--delete" -> loop { options with Mode = Delete } rest
+            | "--dry-run" ->
+                explicitDryRun <- true
+                loop options rest
+            | "--help" | "-h" -> loop { options with Mode = Help } rest
+            | "--duplicates" -> loop { options with Duplicates = true } rest
+            | "--large-files" -> loop { options with LargeFiles = true } rest
+            | "--force" -> loop { options with Force = true } rest
+            | "--allow-root" -> loop { options with AllowRoot = true } rest
+            | "--verbose" | "-v" -> loop { options with Verbose = true } rest
+            | "--json" ->
+                let value, next = readValue flag rest
+                loop { options with JsonPath = value } next
+            | "--markdown" ->
+                let value, next = readValue flag rest
+                loop { options with MarkdownPath = value } next
+            | "--html" ->
+                let value, next = readValue flag rest
+                loop { options with HtmlPath = value } next
+            | "--config" ->
+                let value, next = readValue flag rest
+                loop { options with ConfigPath = value } next
+            | "--hash-algorithm" ->
+                let value, next = readValue flag rest
+                loop { options with HashAlgorithm = value |> Option.map (fun v -> v.ToLowerInvariant()) } next
+            | "--age" ->
+                let value, next = readValue flag rest
+                loop { options with AgeDays = value |> Option.bind (parseInt flag) } next
+            | "--min-size" ->
+                let value, next = readValue flag rest
+                loop { options with MinSizeBytes = value |> Option.bind (parseInt64 flag) } next
+            | "--threads" ->
+                let value, next = readValue flag rest
+                loop { options with Threads = value |> Option.bind (parseInt flag) } next
+            | unknown ->
+                errors.Add(sprintf "unknown option '%s' (try --help)" unknown)
+                loop options rest
+
+    let parsed = loop empty args
+
+    // An explicit dry-run request always wins over a delete request.
+    let final =
+        if explicitDryRun && parsed.Mode = Delete then { parsed with Mode = Scan } else parsed
+
+    if errors.Count > 0 then Error (List.ofSeq errors) else Ok final
+```
+
+- [ ] **Step 5: Run the CLI tests to verify they pass**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: PASS — 125 tests total.
+
+- [ ] **Step 6: Write Json.fsx**
+
+Create `src/Report/Json.fsx`:
+
+```fsharp
+(**
+    JSON report.
+
+    Projects the domain types through the DTO layer before serializing, because
+    System.Text.Json cannot handle F# discriminated unions. This module is also
+    the fixture format for tests and enables diffing two scans.
+*)
+module Report.Json
+
+open System
+open System.Text.Json
+
+open Types
+
+/// Projects one finding into its serialization-safe form.
+let private findingToDto (now: DateTime) (f: Scanner.Finding) : Dto.FindingDto =
+    { Path = f.Meta.Path
+      RuleName = f.RuleName
+      Category = Category.toText f.Category
+      Risk = RiskLevel.toText f.Risk
+      Recoverability = Recoverability.toText f.Recoverability
+      Strategy = DeleteStrategy.toText f.Strategy
+      SizeBytes = f.Meta.SizeBytes
+      AgeDays = (FileMeta.age now f.Meta).TotalDays
+      SafeToDelete = f.Candidate.IsSome
+      Reason = f.Reason }
+
+/// Projects a whole scan result into its serialization-safe form.
+let toDto (result: Scanner.ScanResult) : Dto.ScanResultDto =
+    let now = result.GeneratedAtUtc
+    let categories =
+        Scanner.byCategory result
+        |> List.map (fun (category, findings) ->
+            { Dto.Category = Category.toText category
+              Dto.ItemCount = findings.Length
+              Dto.TotalBytes = findings |> List.sumBy (fun f -> f.Meta.SizeBytes)
+              Dto.ReclaimableBytes =
+                findings
+                |> List.filter (fun f -> f.Candidate.IsSome)
+                |> List.sumBy (fun f -> f.Meta.SizeBytes) })
+
+    { GeneratedAtUtc = result.GeneratedAtUtc.ToString "o"
+      Platform = sprintf "%A" result.Platform
+      ScanRoots = result.ScanRoots
+      TotalItems = result.Findings.Length
+      TotalBytes = result.Findings |> List.sumBy (fun f -> f.Meta.SizeBytes)
+      ReclaimableBytes = Scanner.reclaimableBytes result
+      PendingReviewBytes = Scanner.pendingReviewBytes result
+      Categories = categories
+      Findings = result.Findings |> List.map (findingToDto now)
+      Errors = result.Errors |> List.map FsError.toText
+      UnreadableDirectoryCount = Scanner.unreadableDirectoryCount result
+      ElapsedSeconds = result.Elapsed.TotalSeconds }
+
+/// Writes a JSON report to disk.
+let write (path: string) (result: Scanner.ScanResult) : Result<unit, string> =
+    try
+        let json = JsonSerializer.Serialize(toDto result, Dto.serializerOptions)
+        let directory = IO.Path.GetDirectoryName path
+        if not (String.IsNullOrEmpty directory) && not (IO.Directory.Exists directory) then
+            IO.Directory.CreateDirectory directory |> ignore
+        IO.File.WriteAllText(path, json)
+        Ok ()
+    with ex -> Error (sprintf "cannot write %s: %s" path ex.Message)
+```
+
+- [ ] **Step 7: Write Console.fsx**
+
+Create `src/Report/Console.fsx`:
+
+```fsharp
+(**
+    Console report — the primary interface.
+
+    Two figures are always presented separately: bytes that can be reclaimed
+    automatically, and bytes surfaced for review. Merging them would let a user
+    believe space had been freed when it had only been listed.
+
+    Color degrades automatically when stdout is redirected or NO_COLOR is set.
+*)
+module Report.Console
+
+open System
+open System.Text
+
+open Types
+open Utilities
+
+/// True when ANSI color is appropriate for this stdout.
+let private useColor () =
+    not Console.IsOutputRedirected
+    && String.IsNullOrEmpty(Environment.GetEnvironmentVariable "NO_COLOR")
+
+let private reset = "\027[0m"
+let private bold = "\027[1m"
+let private dim = "\027[90m"
+
+/// Wraps text in a color when color is enabled.
+let private colorize (color: string) (text: string) =
+    if useColor () then color + text + reset else text
+
+/// Renders the risk icon and label for a finding.
+let private riskBadge (level: RiskLevel) =
+    let d = RiskLevel.describe level
+    colorize d.AnsiColor (sprintf "%s %-12s" d.Icon (RiskLevel.toText level))
+
+/// Renders a horizontal rule.
+let private rule () = String.replicate 72 "─"
+
+/// Renders the complete console report.
+let render (result: Scanner.ScanResult) : string =
+    let sb = StringBuilder()
+    let append (text: string) = sb.AppendLine text |> ignore
+
+    let reclaimable = Scanner.reclaimableBytes result
+    let pending = Scanner.pendingReviewBytes result
+
+    append ""
+    append (colorize bold "DiskCleanupAdvisor")
+    append (rule ())
+    append (sprintf "Platform     %A" result.Platform)
+    append (sprintf "Scanned      %d roots, %d items" result.ScanRoots.Length result.Findings.Length)
+    append (sprintf "Duration     %s" (Format.duration result.Elapsed))
+    append ""
+
+    // The two figures, always distinct.
+    append (colorize bold "Space")
+    append (sprintf "  Reclaimable      %s   %s"
+                (colorize "\027[32m" (Format.bytes reclaimable))
+                (colorize dim "eligible for automatic removal"))
+    append (sprintf "  Pending review   %s   %s"
+                (colorize "\027[33m" (Format.bytes pending))
+                (colorize dim "requires your judgment"))
+    append ""
+
+    // Per-category breakdown, largest first.
+    let grouped = Scanner.byCategory result
+    if List.isEmpty grouped then
+        append (colorize dim "  Nothing found.")
+    else
+        append (colorize bold "By category")
+        append (sprintf "  %-26s %10s %10s %8s" "CATEGORY" "TOTAL" "RECLAIM" "ITEMS")
+        for category, findings in grouped do
+            let total = findings |> List.sumBy (fun f -> f.Meta.SizeBytes)
+            let claimable =
+                findings |> List.filter (fun f -> f.Candidate.IsSome) |> List.sumBy (fun f -> f.Meta.SizeBytes)
+            append (sprintf "  %-26s %10s %10s %8d"
+                        (Category.toText category)
+                        (Format.bytes total)
+                        (Format.bytes claimable)
+                        findings.Length)
+    append ""
+
+    // The ten largest individual findings.
+    let largest =
+        result.Findings
+        |> List.sortByDescending (fun f -> f.Meta.SizeBytes)
+        |> List.truncate 10
+    if not (List.isEmpty largest) then
+        append (colorize bold "Largest items")
+        for f in largest do
+            append (sprintf "  %s %10s  %s" (riskBadge f.Risk) (Format.bytes f.Meta.SizeBytes) f.Meta.Path)
+        append ""
+
+    // Diagnostics.
+    append (colorize bold "Diagnostics")
+    append (Diagnostics.render result.Counters)
+    append ""
+
+    // The Full Disk Access hint — actionable, and the difference between a
+    // complete scan and a silently partial one.
+    let unreadable = Scanner.unreadableDirectoryCount result
+    if unreadable > 0 then
+        append (colorize "\027[33m" (sprintf "  %d directories were unreadable." unreadable))
+        append (colorize dim "  Grant Full Disk Access to your terminal in System Settings →")
+        append (colorize dim "  Privacy & Security to include them in the scan.")
+        append ""
+
+    if reclaimable > 0L then
+        append (colorize dim "  This was a dry run. Nothing was modified.")
+        append (colorize dim "  Run with --delete to move the reclaimable items to Trash.")
+        append ""
+
+    sb.ToString()
+```
+
+- [ ] **Step 8: Write the entry point**
+
+Create `DiskCleanupAdvisor.fsx`:
+
+```fsharp
+(**
+    DiskCleanupAdvisor — entry point.
+
+    Finds disposable files, explains why each is disposable, and — only when
+    explicitly asked — moves them to the Trash. Never unlinks.
+
+    Usage:  dotnet fsi DiskCleanupAdvisor.fsx -- [options]
+            dotnet fsi DiskCleanupAdvisor.fsx -- --help
+
+    This file is composition only. All behavior lives in src/.
+*)
+
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Configuration.fsx"
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Configuration.fsx"
+#load "src/Rules.fsx"
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Configuration.fsx"
+#load "src/Rules.fsx"
+#load "src/RiskEngine.fsx"
+#load "src/FileClassifier.fsx"
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Configuration.fsx"
+#load "src/Rules.fsx"
+#load "src/RiskEngine.fsx"
+#load "src/FileClassifier.fsx"
+#load "src/DirectoryWalker.fsx"
+#load "src/Scanner.fsx"
+#load "src/Report/Dto.fsx"
+#load "src/Report/Json.fsx"
+#load "src/Report/Console.fsx"
+#load "src/Cli.fsx"
+
+open System
+
+/// Prints a list of errors to stderr and returns a failure exit code.
+let private fail (errors: string list) : int =
+    eprintfn "Error:"
+    for e in errors do eprintfn "  %s" e
+    1
+
+/// Applies command-line overrides on top of the loaded configuration.
+/// The command line wins over the file, which wins over the defaults.
+let private mergeOptions (options: Cli.Options) (config: Configuration.Config) : Configuration.Config =
+    { config with
+        AgeThresholdDays = defaultArg options.AgeDays config.AgeThresholdDays
+        MinSizeBytes = defaultArg options.MinSizeBytes config.MinSizeBytes
+        ThreadCount = defaultArg options.Threads config.ThreadCount
+        HashAlgorithm = defaultArg options.HashAlgorithm config.HashAlgorithm }
+
+/// Runs a scan and emits every requested report.
+let private runScan (options: Cli.Options) (config: Configuration.Config) (log: Logging.Logger) : int =
+    let fs = Platform.FileSystem.real
+    let platform = Platform.current ()
+
+    log |> Logging.info (sprintf "starting scan on %A" platform)
+
+    let rules = Rules.resolveAll fs platform
+    log |> Logging.info (sprintf "%d rules resolved on this machine" rules.Length)
+
+    if List.isEmpty rules then
+        eprintfn "No rules resolved on this machine. Nothing to scan."
+        0
+    else
+
+    match Scanner.scan fs config options.Force rules with
+    | Error errors -> fail errors
+    | Ok result ->
+        log |> Logging.info (sprintf "scan complete: %d findings" result.Findings.Length)
+
+        // Console output always.
+        printf "%s" (Report.Console.render result)
+
+        // File reports on request. A write failure is reported but does not
+        // discard the scan that already succeeded.
+        let writeFailures =
+            [ match options.JsonPath with
+              | Some path ->
+                  match Report.Json.write path result with
+                  | Ok () -> log |> Logging.info (sprintf "wrote JSON report to %s" path)
+                  | Error e -> yield e
+              | None -> () ]
+
+        if List.isEmpty writeFailures then 0 else fail writeFailures
+
+/// Entry point. `fsi.CommandLineArgs` includes the script name at index 0.
+let private main () : int =
+    let args = fsi.CommandLineArgs |> Array.toList |> List.skip 1
+
+    match Cli.parse args with
+    | Error errors ->
+        eprintfn "%s" Cli.helpText
+        eprintfn ""
+        fail errors
+    | Ok options ->
+
+    match options.Mode with
+    | Cli.Help ->
+        printfn "%s" Cli.helpText
+        0
+    | Cli.Delete ->
+        // Cleaner does not exist yet (Task 15). Until it does, the tool is
+        // structurally incapable of modifying anything, so --delete is
+        // refused explicitly rather than silently ignored.
+        eprintfn "--delete is not yet implemented. Run without it to scan."
+        1
+    | Cli.Scan ->
+        let log =
+            Logging.create (if options.Verbose then Logging.Debug else Logging.Info)
+
+        if Platform.isElevated () && not options.AllowRoot then
+            fail [ "refusing to run with elevated privileges; pass --allow-root to override" ]
+        else
+            match Configuration.load Platform.FileSystem.real options.ConfigPath with
+            | Error errors -> fail errors
+            | Ok config -> runScan options (mergeOptions options config) log
+
+exit (main ())
+```
+
+- [ ] **Step 9: Run the full test suite**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: PASS — 125 tests.
+
+- [ ] **Step 10: Verify --help works**
+
+Run: `dotnet fsi DiskCleanupAdvisor.fsx -- --help`
+
+Expected: the usage text, exit code 0. Verify with `echo "exit=$?"`.
+
+- [ ] **Step 11: Run a real scan — the first end-to-end verification**
+
+Run: `dotnet fsi DiskCleanupAdvisor.fsx -- --scan`
+
+Expected: a full console report showing platform, per-category breakdown, largest items, diagnostics, and — on a machine without Full Disk Access — the unreadable-directories hint.
+
+Confirm all of the following before proceeding:
+- The two space figures are shown **separately** and are not equal by accident.
+- The dry-run notice appears at the end.
+- No file was modified: `git status --short` shows only expected changes.
+
+- [ ] **Step 12: Verify the JSON report and the stdout/stderr split**
+
+```bash
+dotnet fsi DiskCleanupAdvisor.fsx -- --scan --json /tmp/report.json > /dev/null
+python3 -c "import json;d=json.load(open('/tmp/report.json'));print('items',d['totalItems']);print('reclaimable',d['reclaimableBytes']);print('pendingReview',d['pendingReviewBytes'])"
+rm /tmp/report.json
+```
+
+Expected: valid JSON parses, and `reclaimableBytes` and `pendingReviewBytes` are distinct fields. If `json.load` raises, the DTO layer has let a DU through.
+
+- [ ] **Step 13: Commit**
+
+```bash
+git add src/Report/Json.fsx src/Report/Console.fsx src/Cli.fsx DiskCleanupAdvisor.fsx tests/TestCli.fsx tests/Tests.fsx
+git commit -m "feat: add console and JSON reports, CLI, and entry point
+
+First end-to-end usable version: dotnet fsi DiskCleanupAdvisor.fsx
+performs a real scan and reports. Scan is the default mode and
+--dry-run overrides --delete, so a contradictory command line resolves
+to the safer reading. --delete is refused explicitly until Cleaner
+exists, rather than silently ignored.
+
+Reclaimable and pending-review space are always presented as two
+separate figures."
+```
+
+---
+
+**Remaining tasks (14–17) follow in the next section of this plan.**
