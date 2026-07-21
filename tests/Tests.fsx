@@ -15,6 +15,7 @@
 #load "../src/RiskEngine.fsx"
 #load "../src/FileClassifier.fsx"
 #load "../src/DirectoryWalker.fsx"
+#load "../src/Scanner.fsx"
 #load "../src/Report/Dto.fsx"
 #load "TestFramework.fsx"
 #load "TestTypes.fsx"
@@ -26,6 +27,7 @@
 #load "TestRiskEngine.fsx"
 #load "TestFileClassifier.fsx"
 #load "TestDirectoryWalker.fsx"
+#load "TestScanner.fsx"
 #load "TestDto.fsx"
 
 TestTypes.run ()
@@ -37,6 +39,7 @@ TestRules.run ()
 TestRiskEngine.run ()
 TestFileClassifier.run ()
 TestDirectoryWalker.run ()
+TestScanner.run ()
 TestDto.run ()
 
 exit (TestFramework.report ())
