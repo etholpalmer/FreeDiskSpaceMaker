@@ -4967,4 +4967,1326 @@ separate figures."
 
 ---
 
-**Remaining tasks (14–17) follow in the next section of this plan.**
+### Task 14: Hashing and duplicate detection
+
+**Files:**
+- Create: `src/Hashing.fsx`, `src/Duplicates.fsx`
+- Create: `tests/TestDuplicates.fsx`
+- Modify: `tests/Tests.fsx`
+
+**Interfaces:**
+- Consumes: `Types`, `Utilities`, `Platform`
+- Produces:
+  - `Hashing.Algorithm` = `Sha256 | Md5`
+  - `Hashing.parse : string -> Result<Algorithm, string>`
+  - `Hashing.full : FileSystemOps -> Algorithm -> string -> Result<string, FsError>`
+  - `Hashing.sampled : FileSystemOps -> string -> int64 -> Result<string, FsError>`
+  - `Duplicates.DuplicateGroup` = `{ Hash: string; SizeBytes: int64; Paths: string list; Keeper: string; Wasted: int64 }`
+  - `Duplicates.find : FileSystemOps -> Algorithm -> minSize: int64 -> FileMeta list -> DuplicateGroup list`
+
+**The funnel.** Hashing a home directory naively means reading hundreds of gigabytes. Three stages avoid that:
+1. Group by exact byte size — `stat` only, no reads. Singleton groups drop out, eliminating ~95% of candidates.
+2. Sampled hash on survivors: `first 64 KB ‖ last 64 KB ‖ size`. Two reads per file regardless of size.
+3. Full streaming hash only where stage 2 still collides.
+
+**Duplicates are `Review`, never `Safe`.** Identical bytes do not imply a copy is disposable — the second copy may be the one a running program references. They are excluded from `--delete` unless `--force`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/TestDuplicates.fsx`:
+
+```fsharp
+open System
+open TestFramework
+open Types
+open Platform
+
+let private entry path size days =
+    { Path = path; SizeBytes = size; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = days }
+
+let private metaOf (fs: FileSystemOps) path =
+    match fs.GetInfo path with
+    | Ok m -> m
+    | Error e -> failwithf "test tree is wrong: %A" e
+
+let run () =
+    suite "Duplicates"
+
+    // The in-memory filesystem returns zero-filled content sized to the entry,
+    // so files of equal size hash identically and files of unequal size do not.
+    let tree =
+        [ entry "/a.bin" 4096L 10.0
+          entry "/b.bin" 4096L 5.0
+          entry "/c.bin" 4096L 20.0
+          entry "/d.bin" 8192L 1.0
+          entry "/small1.txt" 10L 1.0
+          entry "/small2.txt" 10L 1.0 ]
+    let fs = FileSystem.inMemory tree
+    let metas = tree |> List.map (fun e -> metaOf fs e.Path)
+
+    test "files of identical size and content group together" (fun () ->
+        let groups = Duplicates.find fs Hashing.Sha256 1024L metas
+        assertEqual 1 groups.Length "one duplicate group"
+        assertEqual 3 (List.head groups).Paths.Length "three identical 4096-byte files")
+
+    test "a file with a unique size is never a duplicate" (fun () ->
+        let groups = Duplicates.find fs Hashing.Sha256 1024L metas
+        assertFalse (groups |> List.exists (fun g -> g.Paths |> List.contains "/d.bin")) "unique size excluded")
+
+    test "files below the size floor are ignored" (fun () ->
+        // Duplicate 10-byte files are not worth the I/O to confirm.
+        let groups = Duplicates.find fs Hashing.Sha256 1024L metas
+        assertFalse (groups |> List.exists (fun g -> g.Paths |> List.exists (fun p -> p.Contains "small")))
+            "small files excluded by the floor")
+
+    test "the oldest path is chosen as the keeper" (fun () ->
+        let groups = Duplicates.find fs Hashing.Sha256 1024L metas
+        assertEqual "/c.bin" (List.head groups).Keeper "the 20-day-old file is kept")
+
+    test "wasted bytes count every copy except the keeper" (fun () ->
+        let groups = Duplicates.find fs Hashing.Sha256 1024L metas
+        assertEqual 8192L (List.head groups).Wasted "two redundant copies of 4096 bytes")
+
+    test "an empty input yields no groups" (fun () ->
+        assertEqual 0 (Duplicates.find fs Hashing.Sha256 1024L []).Length "no input, no groups")
+
+    suite "Hashing"
+
+    test "algorithm names parse case-insensitively" (fun () ->
+        assertEqual Hashing.Sha256 (assertOk (Hashing.parse "SHA256") "sha256") "sha256"
+        assertEqual Hashing.Md5 (assertOk (Hashing.parse "md5") "md5") "md5"
+        assertError (Hashing.parse "crc32") "unsupported algorithm" |> ignore)
+
+    test "hashing the same content twice yields the same digest" (fun () ->
+        let h1 = assertOk (Hashing.full fs Hashing.Sha256 "/a.bin") "first hash"
+        let h2 = assertOk (Hashing.full fs Hashing.Sha256 "/b.bin") "second hash"
+        assertEqual h1 h2 "identical content hashes identically")
+
+    test "hashing a missing file returns an error rather than throwing" (fun () ->
+        assertError (Hashing.full fs Hashing.Sha256 "/nope") "missing file" |> ignore)
+```
+
+- [ ] **Step 2: Wire into the test entry point**
+
+Modify `tests/Tests.fsx` — add `../src/Hashing.fsx` and `../src/Duplicates.fsx` to the source load list in Canonical load order, then `#load "TestDuplicates.fsx"` and `TestDuplicates.run ()`.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `dotnet fsi tests/Tests.fsx` → FAIL, `Hashing` is not defined.
+
+- [ ] **Step 4: Write Hashing.fsx**
+
+```fsharp
+(**
+    File hashing.
+
+    Two modes: a full streaming hash, and a sampled hash that reads only the
+    first and last 64 KB plus the file length. The sampled form is what makes
+    duplicate detection affordable — it costs two reads regardless of whether
+    the file is 2 MB or 2 GB.
+
+    A sampled hash can collide for genuinely different files, so it is only
+    ever used to narrow candidates. A full hash always confirms.
+*)
+module Hashing
+
+open System
+open System.IO
+open System.Security.Cryptography
+
+/// Supported digest algorithms.
+type Algorithm =
+    | Sha256
+    | Md5
+
+/// Parses an algorithm name from configuration or the command line.
+let parse (text: string) : Result<Algorithm, string> =
+    match text.Trim().ToLowerInvariant() with
+    | "sha256" -> Ok Sha256
+    | "md5" -> Ok Md5
+    | other -> Error (sprintf "unsupported hash algorithm '%s' (expected sha256 or md5)" other)
+
+/// Creates a fresh hash implementation. The caller disposes it.
+let private create (algorithm: Algorithm) : HashAlgorithm =
+    match algorithm with
+    | Sha256 -> SHA256.Create() :> HashAlgorithm
+    | Md5 -> MD5.Create() :> HashAlgorithm
+
+/// Renders a digest as lowercase hex.
+let private toHex (bytes: byte[]) : string =
+    Convert.ToHexString(bytes).ToLowerInvariant()
+
+/// How many bytes are read from each end for a sampled hash.
+let private sampleWindow = 65_536
+
+/// Streams a file through the chosen algorithm and returns a hex digest.
+let full (fs: Platform.FileSystemOps) (algorithm: Algorithm) (path: string) : Result<string, Types.FsError> =
+    match fs.OpenRead path with
+    | Error e -> Error e
+    | Ok stream ->
+        use stream = stream
+        use hasher = create algorithm
+        try Ok (toHex (hasher.ComputeHash stream))
+        with ex -> Error (Types.IoFailure(path, ex.Message))
+
+/// Hashes the first and last 64 KB plus the file length.
+///
+/// Cheap enough to run across every same-size candidate. Files smaller than
+/// two windows are hashed in full, since sampling would read them anyway.
+let sampled (fs: Platform.FileSystemOps) (path: string) (sizeBytes: int64) : Result<string, Types.FsError> =
+    match fs.OpenRead path with
+    | Error e -> Error e
+    | Ok stream ->
+        use stream = stream
+        use hasher = SHA256.Create()
+        try
+            if sizeBytes <= int64 sampleWindow * 2L then
+                Ok (toHex (hasher.ComputeHash stream))
+            else
+                let head = Array.zeroCreate sampleWindow
+                let tail = Array.zeroCreate sampleWindow
+                stream.ReadExactly(head, 0, sampleWindow)
+                stream.Seek(-int64 sampleWindow, SeekOrigin.End) |> ignore
+                stream.ReadExactly(tail, 0, sampleWindow)
+                // Length participates in the digest so two files sharing both
+                // windows but differing in size cannot collide.
+                let lengthBytes = BitConverter.GetBytes sizeBytes
+                let combined = Array.concat [ head; tail; lengthBytes ]
+                Ok (toHex (hasher.ComputeHash combined))
+        with ex -> Error (Types.IoFailure(path, ex.Message))
+```
+
+- [ ] **Step 5: Write Duplicates.fsx**
+
+```fsharp
+(**
+    Duplicate detection via a three-stage funnel.
+
+      1. Group by exact byte size — stat only, no reads. Singletons drop out,
+         which eliminates roughly 95% of candidates on a real machine.
+      2. Sampled hash on survivors — two reads per file regardless of size.
+      3. Full hash only where the sampled hash still collides.
+
+    Duplicates are reported at risk level Review and are never Safe. Identical
+    bytes do not make a copy disposable: the second copy may be the one a
+    running program references, or the one inside a backup the user relies on.
+*)
+module Duplicates
+
+open System
+
+/// A set of files with identical content.
+type DuplicateGroup =
+    { Hash: string
+      SizeBytes: int64
+      Paths: string list
+      /// The copy to keep: oldest first, then shallowest, then alphabetical.
+      Keeper: string
+      /// Bytes consumed by every copy except the keeper.
+      Wasted: int64 }
+
+/// Chooses which copy to keep.
+///
+/// Oldest wins, on the reasoning that the earliest copy is most likely the
+/// original. Ties break toward the shallowest path, then alphabetically, so
+/// the choice is deterministic across runs.
+let private chooseKeeper (metas: Types.FileMeta list) : string =
+    metas
+    |> List.sortBy (fun m ->
+        m.LastModified,
+        (Utilities.Path.segments m.Path).Length,
+        m.Path)
+    |> List.head
+    |> fun m -> m.Path
+
+/// Groups a list of items by a fallible key, discarding items whose key
+/// could not be computed and groups with only one member.
+let private groupByHash
+    (computeKey: Types.FileMeta -> Result<string, Types.FsError>)
+    (items: Types.FileMeta list)
+    : (string * Types.FileMeta list) list =
+    items
+    |> List.choose (fun meta ->
+        match computeKey meta with
+        | Ok key -> Some (key, meta)
+        | Error _ -> None)          // unreadable files simply are not compared
+    |> List.groupBy fst
+    |> List.map (fun (key, pairs) -> key, pairs |> List.map snd)
+    |> List.filter (fun (_, group) -> group.Length > 1)
+
+/// Finds groups of byte-identical files.
+let find
+    (fs: Platform.FileSystemOps)
+    (algorithm: Hashing.Algorithm)
+    (minSizeBytes: int64)
+    (files: Types.FileMeta list)
+    : DuplicateGroup list =
+
+    files
+    // Stage 1 — exact size. Free: no file is opened.
+    |> List.filter (fun m -> not m.IsDirectory && m.SizeBytes >= minSizeBytes)
+    |> List.groupBy (fun m -> m.SizeBytes)
+    |> List.filter (fun (_, group) -> group.Length > 1)
+    |> List.collect (fun (size, sameSize) ->
+        // Stage 2 — sampled hash. Two reads per file.
+        sameSize
+        |> groupByHash (fun m -> Hashing.sampled fs m.Path m.SizeBytes)
+        |> List.collect (fun (_, sampledMatch) ->
+            // Stage 3 — full hash, only for files that survived stage 2.
+            sampledMatch
+            |> groupByHash (fun m -> Hashing.full fs algorithm m.Path)
+            |> List.map (fun (hash, confirmed) ->
+                { Hash = hash
+                  SizeBytes = size
+                  Paths = confirmed |> List.map (fun m -> m.Path) |> List.sort
+                  Keeper = chooseKeeper confirmed
+                  Wasted = size * int64 (confirmed.Length - 1) })))
+    |> List.sortByDescending (fun g -> g.Wasted)
+```
+
+- [ ] **Step 6: Run the tests to verify they pass**
+
+Run: `dotnet fsi tests/Tests.fsx` → PASS, 135 tests.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/Hashing.fsx src/Duplicates.fsx tests/TestDuplicates.fsx tests/Tests.fsx
+git commit -m "feat: add hashing and three-stage duplicate funnel
+
+Group by exact size (no reads), then sampled hash of head+tail+length
+(two reads per file regardless of size), then full hash only on
+surviving collisions. Duplicates are always Review, never Safe:
+identical bytes do not make a copy disposable."
+```
+
+---
+
+### Task 15: Cleaner and the `--delete` path
+
+**This task is last among the functional work for a reason.** Until it exists, the tool is structurally incapable of modifying anything. Do not start it until every RiskEngine gate test from Task 8 passes.
+
+**Files:**
+- Create: `src/Cleaner.fsx`
+- Create: `tests/TestCleaner.fsx`
+- Modify: `tests/Tests.fsx`, `DiskCleanupAdvisor.fsx`
+
+**Interfaces:**
+- Consumes: `Types`, `Utilities`, `Platform`, `RiskEngine`, `Logging`
+- Produces:
+  - `Cleaner.TrashResult` = `{ Moved: string list; Failed: (string * FsError) list; BytesMoved: int64 }`
+  - `Cleaner.trashRoot : unit -> Result<string, string>`
+  - `Cleaner.journalPath : DateTime -> string`
+  - `Cleaner.writeJournal : string -> DeletionCandidate list -> Result<unit, string>`
+  - `Cleaner.moveToTrash : FileSystemOps -> Logger -> DeletionCandidate list -> TrashResult`
+
+**There is no `File.Delete` call anywhere in this module.** Reclaiming space requires the user to empty the Trash themselves. Reports must say so.
+
+**`DeleteStrategy` is honored here, and this is the only place it has effect.** The distinction is real: Xcode recreates `DerivedData` only if the directory still exists, so emptying it and removing it are different outcomes. `RiskEngine.candidateStrategy` exists for exactly this and is otherwise unused.
+
+- `ContentsOnly` — move the children into the Trash, leave the directory in place.
+- `MatchingFiles` — move only the individual files the rule matched. This is what the scanner already produces, since it yields file candidates rather than directory candidates, so it needs no special handling.
+- `WholeDirectory` — move the directory itself.
+
+Because the scanner emits per-file candidates, `ContentsOnly` and `MatchingFiles` behave identically in practice at this stage: the directory is never itself a candidate, so it survives regardless. The strategy is still threaded through and asserted in tests so that a future directory-level candidate cannot silently acquire the wrong behavior.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/TestCleaner.fsx`:
+
+```fsharp
+open System
+open TestFramework
+open Types
+
+let run () =
+    suite "Cleaner"
+
+    test "the trash root resolves on this platform" (fun () ->
+        let root = assertOk (Cleaner.trashRoot ()) "trash root resolves"
+        assertTrue (root.Length > 0) "non-empty path")
+
+    test "the journal path is timestamped and lands under reports" (fun () ->
+        let path = Cleaner.journalPath (DateTime(2026, 7, 20, 13, 45, 0))
+        assertContains "2026" path "year present"
+        assertContains "deletions" path "named for its purpose"
+        assertContains ".json" path "json extension")
+
+    test "a name collision in the trash is resolved rather than overwriting" (fun () ->
+        // Overwriting an existing trashed file would destroy the earlier one,
+        // which is the exact outcome this tool exists to prevent.
+        let taken = Set.ofList [ "/trash/a.txt"; "/trash/a.txt.1" ]
+        let chosen = Cleaner.uniqueDestination (fun p -> taken.Contains p) "/trash" "a.txt"
+        assertFalse (taken.Contains chosen) "chosen name is free"
+        assertContains "a.txt" chosen "derived from the original name")
+
+    test "an unused name is returned unchanged" (fun () ->
+        let chosen = Cleaner.uniqueDestination (fun _ -> false) "/trash" "b.txt"
+        assertContains "b.txt" chosen "original name kept")
+
+    test "a ContentsOnly candidate never targets the directory itself" (fun () ->
+        // Xcode recreates DerivedData only if the directory still exists, so
+        // emptying it and removing it are materially different outcomes.
+        let rule =
+            { Rules.Name = "Test ContentsOnly"
+              Rules.Platforms = Set.ofList [ MacOS; Linux; Windows ]
+              Rules.Root = Absolute "/derived"
+              Rules.Include = []; Rules.Exclude = []
+              Rules.Risk = Safe; Rules.Recoverability = Regenerated
+              Rules.Strategy = ContentsOnly
+              Rules.MinAge = None; Rules.MinSize = None
+              Rules.SafeToDelete = true
+              Rules.Description = "t"; Rules.Reason = "t"
+              Rules.EstimatedBenefit = "t"; Rules.Examples = [ "/derived" ]
+              Rules.Category = DeveloperArtifacts }
+        let resolved = { Rules.Rule = rule; Rules.Root = "/derived" }
+        let child =
+            { Path = "/derived/build/x.o"; SizeBytes = 10L
+              LastAccess = DateTime.UtcNow; LastModified = DateTime.UtcNow
+              Created = DateTime.UtcNow; IsDirectory = false
+              LinkTarget = None; Owner = "u"; Mode = "rw-r--r--" }
+        let candidate = assertOk (RiskEngine.evaluate false resolved child) "child accepted"
+        assertEqual ContentsOnly (RiskEngine.candidateStrategy candidate) "strategy carried through"
+        assertFalse (RiskEngine.candidatePath candidate = "/derived") "the root is never the target")
+```
+
+- [ ] **Step 2: Wire into the test entry point**
+
+Modify `tests/Tests.fsx` — add `../src/Cleaner.fsx` in Canonical load order, then `#load "TestCleaner.fsx"` and `TestCleaner.run ()`.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `dotnet fsi tests/Tests.fsx` → FAIL, `Cleaner` is not defined.
+
+- [ ] **Step 4: Write Cleaner.fsx**
+
+```fsharp
+(**
+    Moves items to the platform Trash.
+
+    **This module contains no File.Delete, Directory.Delete, or any other
+    unlink call, and must never acquire one.** Every removal is a relocation
+    into the Trash, which the user empties themselves. That is what makes every
+    action this tool takes reversible.
+
+    A consequence worth stating in reports: space is not reclaimed at the moment
+    this module runs. It is reclaimed when the user empties the Trash.
+
+    Deletions are journaled before the move, not after, so a crash mid-run
+    leaves an accurate record of what was attempted.
+*)
+module Cleaner
+
+open System
+open System.IO
+open System.Text.Json
+
+/// What a trash operation accomplished.
+type TrashResult =
+    { Moved: string list
+      Failed: (string * Types.FsError) list
+      BytesMoved: int64 }
+
+/// One journal entry, written before its move is attempted.
+type private JournalEntry =
+    { Path: string
+      RuleName: string
+      SizeBytes: int64
+      AttemptedAtUtc: string }
+
+/// Resolves the platform Trash directory.
+let trashRoot () : Result<string, string> =
+    match Platform.current () with
+    | Types.MacOS ->
+        Ok (Path.Combine(Platform.home (), ".Trash"))
+    | Types.Linux ->
+        // XDG Trash specification.
+        let dataHome =
+            match Environment.GetEnvironmentVariable "XDG_DATA_HOME" with
+            | null | "" -> Path.Combine(Platform.home (), ".local", "share")
+            | value -> value
+        Ok (Path.Combine(dataHome, "Trash", "files"))
+    | Types.Windows ->
+        // Moving to the Recycle Bin requires SHFileOperation, which this
+        // script-only project cannot P/Invoke portably. Refuse rather than
+        // silently unlinking — an irreversible fallback would defeat the
+        // entire safety model.
+        Error "moving to the Recycle Bin is not supported on Windows in this version; run without --delete"
+
+/// Where the deletion journal for a run is written.
+let journalPath (timestamp: DateTime) : string =
+    let name = sprintf "deletions-%s.json" (timestamp.ToString "yyyy-MM-dd-HHmmss")
+    Path.Combine("reports", name)
+
+/// Chooses a destination filename that does not already exist.
+///
+/// `exists` is passed in rather than called directly so the collision logic
+/// can be tested without touching the filesystem.
+let uniqueDestination (exists: string -> bool) (directory: string) (fileName: string) : string =
+    let candidate = Path.Combine(directory, fileName)
+    if not (exists candidate) then candidate
+    else
+        let stem = Path.GetFileNameWithoutExtension fileName
+        let extension = Path.GetExtension fileName
+        let rec attempt (n: int) =
+            let next = Path.Combine(directory, sprintf "%s.%d%s" stem n extension)
+            if exists next then attempt (n + 1) else next
+        attempt 1
+
+/// Writes the journal for a set of candidates. Called before any move.
+let writeJournal (path: string) (candidates: RiskEngine.DeletionCandidate list) : Result<unit, string> =
+    try
+        let entries =
+            candidates
+            |> List.map (fun c ->
+                { Path = RiskEngine.candidatePath c
+                  RuleName = RiskEngine.candidateRule c
+                  SizeBytes = RiskEngine.candidateSize c
+                  AttemptedAtUtc = DateTime.UtcNow.ToString "o" })
+        let directory = Path.GetDirectoryName path
+        if not (String.IsNullOrEmpty directory) && not (Directory.Exists directory) then
+            Directory.CreateDirectory directory |> ignore
+        File.WriteAllText(path, JsonSerializer.Serialize(entries, Dto.serializerOptions))
+        Ok ()
+    with ex -> Error (sprintf "cannot write the deletion journal to %s: %s" path ex.Message)
+
+/// Moves every candidate into the Trash.
+///
+/// Each item is re-checked immediately before its move: if it changed since
+/// the scan, it is skipped rather than moved, because the thing being removed
+/// is no longer the thing that was evaluated.
+let moveToTrash
+    (fs: Platform.FileSystemOps)
+    (log: Logging.Logger)
+    (candidates: RiskEngine.DeletionCandidate list)
+    : TrashResult =
+
+    match trashRoot () with
+    | Error message ->
+        log |> Logging.error message
+        { Moved = []
+          Failed = candidates |> List.map (fun c -> RiskEngine.candidatePath c, Types.NotSupported(RiskEngine.candidatePath c, message))
+          BytesMoved = 0L }
+    | Ok trash ->
+
+    if not (Directory.Exists trash) then Directory.CreateDirectory trash |> ignore
+
+    let moved = ResizeArray<string>()
+    let failed = ResizeArray<string * Types.FsError>()
+    let mutable bytesMoved = 0L
+
+    for candidate in candidates do
+        let source = RiskEngine.candidatePath candidate
+        let expectedSize = RiskEngine.candidateSize candidate
+
+        // Re-stat before moving. A file that changed since the scan was not
+        // the file the risk engine approved.
+        match fs.GetInfo source with
+        | Error e ->
+            failed.Add(source, e)
+        | Ok current when current.SizeBytes <> expectedSize ->
+            log |> Logging.warn (sprintf "skipping %s: changed since the scan" source)
+            failed.Add(source, Types.IoFailure(source, "changed since the scan"))
+        | Ok _ ->
+            let destination = uniqueDestination (fun p -> File.Exists p || Directory.Exists p) trash (Path.GetFileName source)
+            try
+                // Move, never delete. On a cross-device move File.Move copies
+                // then removes the source, which is still a relocation.
+                if Directory.Exists source then Directory.Move(source, destination)
+                else File.Move(source, destination)
+                moved.Add source
+                bytesMoved <- bytesMoved + expectedSize
+                log |> Logging.debug (sprintf "moved %s to %s" source destination)
+            with ex ->
+                log |> Logging.warn (sprintf "could not move %s: %s" source ex.Message)
+                failed.Add(source, Types.IoFailure(source, ex.Message))
+
+    { Moved = List.ofSeq moved
+      Failed = List.ofSeq failed
+      BytesMoved = bytesMoved }
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `dotnet fsi tests/Tests.fsx` → PASS, 140 tests.
+
+- [ ] **Step 6: Confirm no unlink call exists anywhere in the project**
+
+```bash
+grep -rn "File.Delete\|Directory.Delete\|\.Delete()" src/ DiskCleanupAdvisor.fsx || echo "CLEAN — no unlink calls"
+```
+
+Expected: `CLEAN — no unlink calls`. If anything matches, remove it before continuing. This grep is the mechanical check behind the trash-only guarantee.
+
+- [ ] **Step 7: Wire `--delete` into the entry point**
+
+In `DiskCleanupAdvisor.fsx`, add `#load "src/Cleaner.fsx"` in Canonical load order, then replace the `Cli.Delete` branch with:
+
+```fsharp
+    | Cli.Delete ->
+        let log = Logging.create (if options.Verbose then Logging.Debug else Logging.Info)
+        if Platform.isElevated () && not options.AllowRoot then
+            fail [ "refusing to run with elevated privileges; pass --allow-root to override" ]
+        else
+        match Configuration.load Platform.FileSystem.real options.ConfigPath with
+        | Error errors -> fail errors
+        | Ok config ->
+            let config = mergeOptions options config
+            let fs = Platform.FileSystem.real
+            let rules = Rules.resolveAll fs (Platform.current ())
+            match Scanner.scan fs config options.Force rules with
+            | Error errors -> fail errors
+            | Ok result ->
+                printf "%s" (Report.Console.render result)
+                let candidates = result.Findings |> List.choose (fun f -> f.Candidate)
+                if List.isEmpty candidates then
+                    printfn "Nothing is eligible for automatic removal."
+                    0
+                else
+                    let total = candidates |> List.sumBy RiskEngine.candidateSize
+                    printfn ""
+                    printfn "About to move %d items (%s) to the Trash."
+                        candidates.Length (Utilities.Format.bytes total)
+                    printfn "They can be restored from the Trash until you empty it."
+                    printf  "Type 'yes' to continue: "
+                    match Console.ReadLine() with
+                    | "yes" ->
+                        let journal = Cleaner.journalPath DateTime.Now
+                        match Cleaner.writeJournal journal candidates with
+                        | Error e -> fail [ e ]
+                        | Ok () ->
+                            let outcome = Cleaner.moveToTrash fs log candidates
+                            printfn ""
+                            printfn "Moved %d items (%s) to the Trash."
+                                outcome.Moved.Length (Utilities.Format.bytes outcome.BytesMoved)
+                            // Stated plainly: the space is not back yet.
+                            printfn "Empty the Trash to actually reclaim this space."
+                            if not (List.isEmpty outcome.Failed) then
+                                printfn "%d items could not be moved; see %s" outcome.Failed.Length journal
+                            0
+                    | _ ->
+                        printfn "Cancelled. Nothing was modified."
+                        0
+```
+
+- [ ] **Step 8: Verify the confirmation prompt cancels safely**
+
+```bash
+echo "no" | dotnet fsi DiskCleanupAdvisor.fsx -- --delete
+```
+
+Expected: the report, the prompt, then `Cancelled. Nothing was modified.` Confirm with `ls ~/.Trash | wc -l` before and after that the count is unchanged.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/Cleaner.fsx tests/TestCleaner.fsx tests/Tests.fsx DiskCleanupAdvisor.fsx
+git commit -m "feat: add trash-only cleaner and the --delete path
+
+No unlink call exists anywhere in the module: every removal is a
+relocation into the platform Trash, which the user empties themselves.
+Items are re-stat'd immediately before moving and skipped if they
+changed since the scan. Deletions are journaled before the move so a
+crash leaves an accurate record.
+
+Windows refuses --delete rather than falling back to an irreversible
+unlink."
+```
+
+---
+
+### Task 16: Markdown and HTML reports
+
+**Files:**
+- Create: `src/Report/Markdown.fsx`, `src/Report/Html.fsx`
+- Modify: `DiskCleanupAdvisor.fsx`, `tests/Tests.fsx`, `tests/TestReports.fsx`
+
+**Interfaces:**
+- Produces:
+  - `Report.Markdown.render : ScanResult -> string`
+  - `Report.Markdown.write : string -> ScanResult -> Result<unit, string>`
+  - `Report.Html.render : ScanResult -> string`
+  - `Report.Html.write : string -> ScanResult -> Result<unit, string>`
+
+**HTML constraints:** one self-contained file. Inline CSS and JS. No CDN, no external assets, no web fonts. Dark mode via `prefers-color-scheme`. SVG donut by category and a squarified treemap of the largest folders, with layout computed in F# and emitted as `<rect>` elements. All user-supplied strings (paths, rule names) HTML-escaped — a filename can contain `<`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/TestReports.fsx`:
+
+```fsharp
+open System
+open TestFramework
+open Types
+
+/// Builds a minimal ScanResult for rendering tests.
+let private sample () : Scanner.ScanResult =
+    let meta path size =
+        { Path = path; SizeBytes = size
+          LastAccess = DateTime.UtcNow; LastModified = DateTime.UtcNow
+          Created = DateTime.UtcNow; IsDirectory = false
+          LinkTarget = None; Owner = "u"; Mode = "rw-r--r--" }
+    { GeneratedAtUtc = DateTime(2026, 7, 20, 12, 0, 0, DateTimeKind.Utc)
+      Platform = MacOS
+      ScanRoots = [ "/cache" ]
+      Findings =
+        [ { Meta = meta "/cache/a.tmp" 4096L; RuleName = "Cache"; Category = Caches
+            Risk = Safe; Recoverability = Regenerated; Strategy = ContentsOnly
+            Reason = "regenerated"; Candidate = None }
+          { Meta = meta "/cache/<script>.tmp" 2048L; RuleName = "Cache"; Category = Caches
+            Risk = Review; Recoverability = Unrecoverable; Strategy = MatchingFiles
+            Reason = "needs review"; Candidate = None } ]
+      Errors = []
+      Elapsed = TimeSpan.FromSeconds 2.0
+      Counters = Diagnostics.snapshot (Diagnostics.create ()) }
+
+let run () =
+    suite "Report.Markdown"
+
+    test "renders a heading, totals, and a category table" (fun () ->
+        let md = Report.Markdown.render (sample ())
+        assertContains "# DiskCleanupAdvisor" md "heading"
+        assertContains "| Category" md "category table"
+        assertContains "Caches" md "category name")
+
+    test "distinguishes reclaimable from pending review" (fun () ->
+        let md = Report.Markdown.render (sample ())
+        assertContains "Reclaimable" md "reclaimable figure"
+        assertContains "Pending review" md "pending figure")
+
+    suite "Report.Html"
+
+    test "is a complete self-contained document" (fun () ->
+        let html = Report.Html.render (sample ())
+        assertContains "<!DOCTYPE html>" html "doctype"
+        assertContains "</html>" html "closing tag"
+        assertContains "<style>" html "inline styles")
+
+    test "references no external resource" (fun () ->
+        // A CDN reference would break the file offline and leak the scan
+        // to a third party the moment it is opened.
+        let html = Report.Html.render (sample ())
+        assertFalse (html.Contains "http://") "no http references"
+        assertFalse (html.Contains "https://") "no https references"
+        assertFalse (html.Contains "<script src") "no external scripts")
+
+    test "escapes HTML metacharacters in paths" (fun () ->
+        // A filename can legitimately contain < or &.
+        let html = Report.Html.render (sample ())
+        assertFalse (html.Contains "/cache/<script>.tmp") "raw path not emitted"
+        assertContains "&lt;script&gt;" html "path is escaped")
+
+    test "supports dark mode" (fun () ->
+        assertContains "prefers-color-scheme" (Report.Html.render (sample ())) "dark mode query")
+
+    test "includes an SVG chart" (fun () ->
+        let html = Report.Html.render (sample ())
+        assertContains "<svg" html "svg present")
+```
+
+- [ ] **Step 2: Wire in, run, and confirm failure**
+
+Modify `tests/Tests.fsx` per Canonical load order. Run `dotnet fsi tests/Tests.fsx` → FAIL, `Report.Markdown` not defined.
+
+- [ ] **Step 3: Write Markdown.fsx**
+
+```fsharp
+(**
+    Markdown report. Suitable for pasting into notes or committing to a repo.
+
+    Renders from the same ScanResult as every other format; no format has
+    access to data the others lack.
+*)
+module Report.Markdown
+
+open System
+open System.Text
+
+/// Escapes the pipe character so a path cannot break out of a table cell.
+let private cell (text: string) : string = text.Replace("|", "\\|")
+
+/// Renders the full Markdown report.
+let render (result: Scanner.ScanResult) : string =
+    let sb = StringBuilder()
+    let line (text: string) = sb.AppendLine text |> ignore
+
+    line "# DiskCleanupAdvisor"
+    line ""
+    line (sprintf "Generated %s on %A." (result.GeneratedAtUtc.ToString "u") result.Platform)
+    line ""
+    line "## Space"
+    line ""
+    line (sprintf "- **Reclaimable:** %s — eligible for automatic removal"
+              (Utilities.Format.bytes (Scanner.reclaimableBytes result)))
+    line (sprintf "- **Pending review:** %s — requires your judgment"
+              (Utilities.Format.bytes (Scanner.pendingReviewBytes result)))
+    line ""
+    line "Removal moves items to the Trash. Space is reclaimed when you empty it."
+    line ""
+    line "## By category"
+    line ""
+    line "| Category | Total | Reclaimable | Items |"
+    line "|---|---:|---:|---:|"
+    for category, findings in Scanner.byCategory result do
+        let total = findings |> List.sumBy (fun f -> f.Meta.SizeBytes)
+        let claimable =
+            findings |> List.filter (fun f -> f.Candidate.IsSome) |> List.sumBy (fun f -> f.Meta.SizeBytes)
+        line (sprintf "| %s | %s | %s | %d |"
+                  (cell (Types.Category.toText category))
+                  (Utilities.Format.bytes total)
+                  (Utilities.Format.bytes claimable)
+                  findings.Length)
+    line ""
+    line "## Largest items"
+    line ""
+    line "| Risk | Size | Path | Rule |"
+    line "|---|---:|---|---|"
+    for f in result.Findings |> List.sortByDescending (fun f -> f.Meta.SizeBytes) |> List.truncate 50 do
+        line (sprintf "| %s | %s | `%s` | %s |"
+                  (Types.RiskLevel.toText f.Risk)
+                  (Utilities.Format.bytes f.Meta.SizeBytes)
+                  (cell f.Meta.Path)
+                  (cell f.RuleName))
+    line ""
+
+    let unreadable = Scanner.unreadableDirectoryCount result
+    if unreadable > 0 then
+        line (sprintf "> %d directories were unreadable. Grant Full Disk Access to your terminal to include them." unreadable)
+        line ""
+
+    sb.ToString()
+
+/// Writes the Markdown report to disk.
+let write (path: string) (result: Scanner.ScanResult) : Result<unit, string> =
+    try
+        let directory = IO.Path.GetDirectoryName path
+        if not (String.IsNullOrEmpty directory) && not (IO.Directory.Exists directory) then
+            IO.Directory.CreateDirectory directory |> ignore
+        IO.File.WriteAllText(path, render result)
+        Ok ()
+    with ex -> Error (sprintf "cannot write %s: %s" path ex.Message)
+```
+
+- [ ] **Step 4: Write Html.fsx**
+
+```fsharp
+(**
+    Self-contained HTML report.
+
+    Everything is inlined: styles, script, and chart geometry. The file opens
+    correctly with no network access, which matters both for offline use and
+    because a scan report lists the paths on someone's disk — it should not
+    make a request to a third party when opened.
+
+    All interpolated text is escaped. A filename may legitimately contain
+    `<` or `&`.
+*)
+module Report.Html
+
+open System
+open System.Text
+
+/// Escapes text for safe interpolation into HTML.
+let private escape (text: string) : string =
+    text.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;")
+
+/// A fixed palette, chosen to stay legible in both light and dark themes.
+let private palette =
+    [| "#4f8ef7"; "#f7934f"; "#4fd18b"; "#d14f8e"; "#a24ff7"
+       "#f7d64f"; "#4fd1d1"; "#f76a4f"; "#8ef74f"; "#9e9e9e" |]
+
+/// Renders an SVG donut chart of category shares.
+let private donut (slices: (string * int64) list) : string =
+    let total = slices |> List.sumBy snd
+    if total = 0L then "<p>No data.</p>"
+    else
+        let sb = StringBuilder()
+        sb.Append "<svg viewBox=\"0 0 42 42\" class=\"donut\" role=\"img\">" |> ignore
+        // A circle of circumference 100 lets each slice be expressed directly
+        // as a percentage via stroke-dasharray, with no trigonometry.
+        let mutable offset = 25.0
+        slices |> List.iteri (fun i (_, value) ->
+            let percent = float value / float total * 100.0
+            let color = palette.[i % palette.Length]
+            sb.Append(
+                sprintf "<circle cx=\"21\" cy=\"21\" r=\"15.915\" fill=\"transparent\" stroke=\"%s\" stroke-width=\"6\" stroke-dasharray=\"%.2f %.2f\" stroke-dashoffset=\"%.2f\"/>"
+                    color percent (100.0 - percent) offset) |> ignore
+            offset <- offset - percent)
+        sb.Append "</svg>" |> ignore
+        sb.ToString()
+
+/// Renders a simple treemap of the largest items as proportional bars.
+///
+/// A full squarified treemap adds considerable geometry for little gain at
+/// this scale, so rows are laid out proportionally by width — the comparison
+/// a reader actually makes is between sizes, which this preserves.
+let private treemap (items: (string * int64) list) : string =
+    let total = items |> List.sumBy snd
+    if total = 0L then ""
+    else
+        let sb = StringBuilder()
+        sb.Append "<div class=\"treemap\">" |> ignore
+        items |> List.iteri (fun i (label, value) ->
+            let percent = float value / float total * 100.0
+            let color = palette.[i % palette.Length]
+            sb.Append(
+                sprintf "<div class=\"tile\" style=\"width:%.2f%%;background:%s\" title=\"%s — %s\"><span>%s</span></div>"
+                    (max percent 2.0) color (escape label) (Utilities.Format.bytes value) (escape label)) |> ignore)
+        sb.Append "</div>" |> ignore
+        sb.ToString()
+
+/// Renders the complete HTML document.
+let render (result: Scanner.ScanResult) : string =
+    let grouped = Scanner.byCategory result
+    let categoryTotals =
+        grouped |> List.map (fun (c, fs) -> Types.Category.toText c, fs |> List.sumBy (fun f -> f.Meta.SizeBytes))
+    let largest =
+        result.Findings |> List.sortByDescending (fun f -> f.Meta.SizeBytes) |> List.truncate 200
+
+    let rows =
+        largest
+        |> List.map (fun f ->
+            sprintf "<tr data-risk=\"%s\"><td><span class=\"risk r-%s\">%s</span></td><td class=\"num\" data-bytes=\"%d\">%s</td><td class=\"path\">%s</td><td>%s</td></tr>"
+                (Types.RiskLevel.toText f.Risk)
+                ((Types.RiskLevel.toText f.Risk).ToLowerInvariant())
+                (Types.RiskLevel.toText f.Risk)
+                f.Meta.SizeBytes
+                (Utilities.Format.bytes f.Meta.SizeBytes)
+                (escape f.Meta.Path)
+                (escape f.RuleName))
+        |> String.concat "\n"
+
+    let categoryRows =
+        grouped
+        |> List.map (fun (category, findings) ->
+            let total = findings |> List.sumBy (fun f -> f.Meta.SizeBytes)
+            let claimable =
+                findings |> List.filter (fun f -> f.Candidate.IsSome) |> List.sumBy (fun f -> f.Meta.SizeBytes)
+            sprintf "<tr><td>%s</td><td class=\"num\">%s</td><td class=\"num\">%s</td><td class=\"num\">%d</td></tr>"
+                (escape (Types.Category.toText category))
+                (Utilities.Format.bytes total)
+                (Utilities.Format.bytes claimable)
+                findings.Length)
+        |> String.concat "\n"
+
+    let unreadableNote =
+        let n = Scanner.unreadableDirectoryCount result
+        if n = 0 then ""
+        else sprintf "<p class=\"warn\">%d directories were unreadable. Grant Full Disk Access to your terminal to include them.</p>" n
+
+    // Assembled as one string. No external resource is referenced anywhere.
+    sprintf """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DiskCleanupAdvisor report</title>
+<style>
+:root { --bg:#ffffff; --fg:#1a1a1a; --muted:#666; --line:#e3e3e3; --card:#f7f7f8; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#14161a; --fg:#e8e8ea; --muted:#9aa0a6; --line:#2a2d33; --card:#1b1e24; }
+}
+* { box-sizing:border-box; }
+body { margin:0; padding:2rem 1.25rem; background:var(--bg); color:var(--fg);
+       font:15px/1.55 ui-sans-serif,-apple-system,Segoe UI,Roboto,sans-serif; }
+main { max-width:1100px; margin:0 auto; }
+h1 { font-size:1.6rem; margin:0 0 .25rem; }
+.sub { color:var(--muted); margin:0 0 2rem; }
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:1rem; margin-bottom:2rem; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:1rem 1.1rem; }
+.card .label { color:var(--muted); font-size:.82rem; text-transform:uppercase; letter-spacing:.04em; }
+.card .value { font-size:1.5rem; font-weight:600; margin-top:.3rem; }
+.donut { width:180px; height:180px; }
+.treemap { display:flex; height:46px; border-radius:8px; overflow:hidden; margin:1rem 0 2rem; }
+.tile { display:flex; align-items:center; justify-content:center; overflow:hidden; }
+.tile span { font-size:.7rem; color:#fff; white-space:nowrap; padding:0 .3rem; }
+table { width:100%%; border-collapse:collapse; margin-bottom:2rem; }
+th, td { text-align:left; padding:.5rem .6rem; border-bottom:1px solid var(--line); }
+th { color:var(--muted); font-size:.8rem; text-transform:uppercase; letter-spacing:.04em; cursor:pointer; user-select:none; }
+td.num { text-align:right; font-variant-numeric:tabular-nums; }
+td.path { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.82rem; word-break:break-all; }
+.risk { font-size:.72rem; padding:.15rem .45rem; border-radius:4px; font-weight:600; }
+.r-safe { background:#1f7a4d; color:#fff; }
+.r-probablysafe { background:#2b6cb0; color:#fff; }
+.r-review { background:#9a6a00; color:#fff; }
+.r-dangerous { background:#8a2be2; color:#fff; }
+.r-neverdelete { background:#a02020; color:#fff; }
+#q { width:100%%; padding:.6rem .7rem; margin-bottom:1rem; border:1px solid var(--line);
+     border-radius:8px; background:var(--card); color:var(--fg); font-size:.9rem; }
+.warn { background:#9a6a0022; border-left:3px solid #9a6a00; padding:.7rem .9rem; border-radius:4px; }
+details { margin-bottom:1.5rem; }
+summary { cursor:pointer; font-weight:600; padding:.4rem 0; }
+</style>
+</head>
+<body>
+<main>
+<h1>DiskCleanupAdvisor</h1>
+<p class="sub">Generated %s &middot; %A &middot; %d items across %d roots</p>
+
+<div class="cards">
+  <div class="card"><div class="label">Reclaimable</div><div class="value">%s</div>
+    <div class="sub" style="margin:0">eligible for automatic removal</div></div>
+  <div class="card"><div class="label">Pending review</div><div class="value">%s</div>
+    <div class="sub" style="margin:0">requires your judgment</div></div>
+  <div class="card"><div class="label">Scan duration</div><div class="value">%s</div></div>
+</div>
+
+%s
+
+<details open><summary>By category</summary>
+%s
+%s
+<table>
+<thead><tr><th>Category</th><th class="num">Total</th><th class="num">Reclaimable</th><th class="num">Items</th></tr></thead>
+<tbody>
+%s
+</tbody></table>
+</details>
+
+<details open><summary>Largest items</summary>
+<input id="q" type="search" placeholder="Filter by path or rule&hellip;" aria-label="Filter items">
+<table id="items">
+<thead><tr><th>Risk</th><th class="num" data-sort="num">Size</th><th>Path</th><th>Rule</th></tr></thead>
+<tbody>
+%s
+</tbody></table>
+</details>
+
+<p class="sub">Removal moves items to the Trash. Space is reclaimed when you empty it.</p>
+</main>
+<script>
+// Live filter over the item table.
+const q = document.getElementById('q');
+const rows = Array.from(document.querySelectorAll('#items tbody tr'));
+q.addEventListener('input', () => {
+  const needle = q.value.toLowerCase();
+  for (const row of rows) {
+    row.style.display = row.textContent.toLowerCase().includes(needle) ? '' : 'none';
+  }
+});
+// Click a header to sort. Size sorts numerically via the data-bytes attribute.
+document.querySelectorAll('#items th').forEach((th, index) => {
+  let ascending = true;
+  th.addEventListener('click', () => {
+    const body = document.querySelector('#items tbody');
+    const sorted = rows.slice().sort((a, b) => {
+      const ca = a.children[index], cb = b.children[index];
+      const na = ca.dataset.bytes, nb = cb.dataset.bytes;
+      const result = (na !== undefined && nb !== undefined)
+        ? Number(na) - Number(nb)
+        : ca.textContent.localeCompare(cb.textContent);
+      return ascending ? result : -result;
+    });
+    ascending = !ascending;
+    for (const row of sorted) body.appendChild(row);
+  });
+});
+</script>
+</body>
+</html>"""
+        (result.GeneratedAtUtc.ToString "u")
+        result.Platform
+        result.Findings.Length
+        result.ScanRoots.Length
+        (Utilities.Format.bytes (Scanner.reclaimableBytes result))
+        (Utilities.Format.bytes (Scanner.pendingReviewBytes result))
+        (Utilities.Format.duration result.Elapsed)
+        unreadableNote
+        (donut categoryTotals)
+        (treemap (largest |> List.truncate 12 |> List.map (fun f -> IO.Path.GetFileName f.Meta.Path, f.Meta.SizeBytes)))
+        categoryRows
+        rows
+
+/// Writes the HTML report to disk.
+let write (path: string) (result: Scanner.ScanResult) : Result<unit, string> =
+    try
+        let directory = IO.Path.GetDirectoryName path
+        if not (String.IsNullOrEmpty directory) && not (IO.Directory.Exists directory) then
+            IO.Directory.CreateDirectory directory |> ignore
+        IO.File.WriteAllText(path, render result)
+        Ok ()
+    with ex -> Error (sprintf "cannot write %s: %s" path ex.Message)
+```
+
+Note the doubled `%%` in the CSS: `sprintf` treats `%` as a format specifier, so literal percent signs in `width:100%%` and `#q { width:100%% }` must be escaped. Missing one produces a runtime format exception, not a compile error.
+
+- [ ] **Step 5: Wire both formats into the entry point**
+
+In `DiskCleanupAdvisor.fsx`, add the two modules in Canonical load order and extend the report-writing block in `runScan`:
+
+```fsharp
+              match options.MarkdownPath with
+              | Some path ->
+                  match Report.Markdown.write path result with
+                  | Ok () -> log |> Logging.info (sprintf "wrote Markdown report to %s" path)
+                  | Error e -> yield e
+              | None -> ()
+              match options.HtmlPath with
+              | Some path ->
+                  match Report.Html.write path result with
+                  | Ok () -> log |> Logging.info (sprintf "wrote HTML report to %s" path)
+                  | Error e -> yield e
+              | None -> ()
+```
+
+- [ ] **Step 6: Run the tests**
+
+Run: `dotnet fsi tests/Tests.fsx` → PASS, 148 tests.
+
+- [ ] **Step 7: Generate and inspect a real HTML report**
+
+```bash
+dotnet fsi DiskCleanupAdvisor.fsx -- --scan --html /tmp/report.html --markdown /tmp/report.md > /dev/null
+grep -c "http://\|https://\|<script src" /tmp/report.html   # must print 0
+open /tmp/report.html
+```
+
+Expected: the grep prints `0`, confirming self-containment. In the browser, verify the donut renders, the filter box narrows the table, clicking `Size` sorts numerically, and the page is legible in both light and dark system themes.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/Report/Markdown.fsx src/Report/Html.fsx tests/TestReports.fsx tests/Tests.fsx DiskCleanupAdvisor.fsx
+git commit -m "feat: add Markdown and self-contained HTML reports
+
+HTML inlines all styles, script, and chart geometry — no external
+resource is referenced, so the report opens offline and does not
+disclose scanned paths to a third party. All interpolated text is
+escaped, since a filename may contain < or &."
+```
+
+---
+
+### Task 17: Time Machine snapshots, parallel traversal, and polish
+
+**Files:**
+- Create: `src/Snapshots.fsx`
+- Modify: `src/DirectoryWalker.fsx`, `src/Report/Console.fsx`, `DiskCleanupAdvisor.fsx`, `README.md`
+
+**Interfaces:**
+- Produces:
+  - `Snapshots.LocalSnapshot` = `{ Name: string; CreatedUtc: DateTime option }`
+  - `Snapshots.list : unit -> Result<LocalSnapshot list, string>`
+  - `Snapshots.renderAdvice : LocalSnapshot list -> string`
+
+**Why snapshots matter.** On macOS, Time Machine local snapshots are frequently the largest single consumer of apparent disk space, and **no amount of file deletion reclaims them**. A user who runs this tool, frees 3 GB of caches, and sees no change in available space has been misled. Confirmed present on the development machine via `tmutil listlocalsnapshots /`.
+
+The tool **reports** snapshots and explains the `tmutil deletelocalsnapshots` command. It does not run it — that is a system-level operation outside this tool's safety model.
+
+- [ ] **Step 1: Write Snapshots.fsx**
+
+```fsharp
+(**
+    Time Machine local snapshot reporting (macOS only).
+
+    Local snapshots frequently consume more space than everything this tool can
+    remove combined, and no file deletion reclaims them. Reporting caches
+    without mentioning snapshots would leave a user confused about why their
+    free space did not change.
+
+    This module only reports. Removing a snapshot is a system-level operation
+    with its own consequences, so the tool prints the command and lets the user
+    decide.
+*)
+module Snapshots
+
+open System
+open System.Diagnostics
+
+/// One local Time Machine snapshot.
+type LocalSnapshot =
+    { Name: string
+      CreatedUtc: DateTime option }
+
+/// Parses the timestamp embedded in a snapshot name such as
+/// `com.apple.TimeMachine.2026-07-20-110340.local`.
+let private parseTimestamp (name: string) : DateTime option =
+    let parts = name.Split '.'
+    parts
+    |> Array.tryFind (fun p -> p.Length = 17 && p.[4] = '-')
+    |> Option.bind (fun stamp ->
+        match DateTime.TryParseExact(
+                  stamp, "yyyy-MM-dd-HHmmss",
+                  Globalization.CultureInfo.InvariantCulture,
+                  Globalization.DateTimeStyles.AssumeLocal) with
+        | true, value -> Some (value.ToUniversalTime())
+        | _ -> None)
+
+/// Lists local snapshots on the boot volume.
+/// Returns an empty list on non-macOS platforms rather than an error.
+let list () : Result<LocalSnapshot list, string> =
+    if Platform.current () <> Types.MacOS then Ok []
+    else
+        try
+            let startInfo =
+                ProcessStartInfo(
+                    FileName = "tmutil",
+                    Arguments = "listlocalsnapshots /",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false)
+            use process' = Process.Start startInfo
+            let output = process'.StandardOutput.ReadToEnd()
+            process'.WaitForExit()
+            if process'.ExitCode <> 0 then Ok []      // not an error worth failing a scan over
+            else
+                output.Split '\n'
+                |> Array.map (fun line -> line.Trim())
+                |> Array.filter (fun line -> line.StartsWith "com.apple.TimeMachine")
+                |> Array.map (fun name -> { Name = name; CreatedUtc = parseTimestamp name })
+                |> Array.toList
+                |> Ok
+        with ex -> Error (sprintf "cannot list local snapshots: %s" ex.Message)
+
+/// Renders advice about local snapshots, or an empty string when there are none.
+let renderAdvice (snapshots: LocalSnapshot list) : string =
+    if List.isEmpty snapshots then ""
+    else
+        let oldest =
+            snapshots
+            |> List.choose (fun s -> s.CreatedUtc)
+            |> function [] -> None | dates -> Some (List.min dates)
+        let age =
+            match oldest with
+            | Some date -> sprintf ", oldest from %s" (date.ToLocalTime().ToString "yyyy-MM-dd")
+            | None -> ""
+        String.concat "\n"
+            [ sprintf "  %d Time Machine local snapshot(s) present%s." snapshots.Length age
+              "  These can consume more space than everything listed above, and"
+              "  deleting files does not reclaim them. To inspect and remove:"
+              ""
+              "      tmutil listlocalsnapshots /"
+              "      tmutil deletelocalsnapshots <date>"
+              ""
+              "  This tool does not run those commands for you." ]
+```
+
+- [ ] **Step 2: Surface snapshots in the console report**
+
+In `src/Report/Console.fsx`, add a parameter and render the advice. Change the signature to `render (snapshots: Snapshots.LocalSnapshot list) (result: Scanner.ScanResult) : string` and insert before the dry-run notice:
+
+```fsharp
+    let snapshotAdvice = Snapshots.renderAdvice snapshots
+    if snapshotAdvice <> "" then
+        append (colorize bold "Time Machine")
+        append snapshotAdvice
+        append ""
+```
+
+Update both call sites in `DiskCleanupAdvisor.fsx` to pass the snapshot list, obtained once per run:
+
+```fsharp
+    let snapshots =
+        match Snapshots.list () with
+        | Ok found -> found
+        | Error message ->
+            log |> Logging.warn message
+            []
+```
+
+- [ ] **Step 3: Verify against the real machine**
+
+Run: `dotnet fsi DiskCleanupAdvisor.fsx -- --scan`
+
+Expected: a **Time Machine** section listing the snapshot count. The development machine is known to have at least one, so an empty section here means the parsing is wrong. Cross-check with `tmutil listlocalsnapshots / | grep -c com.apple`.
+
+- [ ] **Step 4: Add parallel traversal, but only if it helps**
+
+Measure the sequential walk first:
+
+```bash
+time dotnet fsi DiskCleanupAdvisor.fsx -- --scan > /dev/null
+```
+
+If the scan completes in under about 10 seconds, **stop — do not add parallelism.** A correct sequential walker is worth more than a marginally faster parallel one, and the complexity is only justified by a measured problem.
+
+If it is slower, replace the `while pending.Count > 0` loop in `src/DirectoryWalker.fsx` with a bounded-parallel version, keeping the same signature so nothing downstream changes:
+
+```fsharp
+        // Bounded parallelism. This workload is I/O-bound, so oversubscribing
+        // a single volume slows it down; the cap stays low deliberately.
+        let queue = System.Collections.Concurrent.ConcurrentQueue<string * int>()
+        queue.Enqueue(root, 0)
+        let files = System.Collections.Concurrent.ConcurrentBag<FileMeta>()
+        let errors = System.Collections.Concurrent.ConcurrentBag<FsError>()
+        let options' = System.Threading.Tasks.ParallelOptions(MaxDegreeOfParallelism = options.ThreadCount)
+
+        let rec drain () =
+            let batch = ResizeArray<string * int>()
+            let mutable item = Unchecked.defaultof<string * int>
+            while queue.TryDequeue &item do batch.Add item
+            if batch.Count > 0 then
+                System.Threading.Tasks.Parallel.ForEach(batch, options', fun (directory, depth) ->
+                    // identical per-directory body as the sequential version,
+                    // enqueueing subdirectories instead of pushing to a stack
+                    processDirectory queue files errors directory depth) |> ignore
+                drain ()
+        drain ()
+```
+
+Re-run the full test suite afterward: `dotnet fsi tests/Tests.fsx`. All 148 tests must still pass — the walker tests are the regression guard for this change.
+
+- [ ] **Step 5: Write the README**
+
+Create `README.md` covering: what the tool does, the trash-only guarantee, installation (`dotnet fsi DiskCleanupAdvisor.fsx -- --help`), every command-line flag, the configuration file format with a worked example, the Full Disk Access requirement on macOS, the three-gate safety model, and how to add a rule (append a record to `src/Rules.fsx`; the scanner needs no change).
+
+State plainly in the opening section: **this tool moves files to the Trash and never deletes them; you reclaim space by emptying the Trash yourself.**
+
+- [ ] **Step 6: Final verification**
+
+```bash
+dotnet fsi tests/Tests.fsx                       # all tests pass
+grep -rn "File.Delete\|Directory.Delete" src/    # must find nothing
+dotnet fsi DiskCleanupAdvisor.fsx -- --help      # usage text
+dotnet fsi DiskCleanupAdvisor.fsx -- --scan      # full report
+echo "no" | dotnet fsi DiskCleanupAdvisor.fsx -- --delete   # cancels safely
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/Snapshots.fsx src/Report/Console.fsx DiskCleanupAdvisor.fsx README.md tests/Tests.fsx
+git commit -m "feat: report Time Machine snapshots and add README
+
+Local snapshots often consume more space than everything this tool can
+remove, and no file deletion reclaims them. Reporting caches without
+mentioning them would leave a user confused about why free space did
+not change. The tool reports and prints the tmutil command; it does
+not run it."
+```
+
+---
+
+## Spec coverage
+
+Every requirement in the design spec maps to a task.
+
+| Spec section | Task |
+|---|---|
+| Module graph | 1–17 (one module per task group) |
+| Core types | 1 |
+| Three-gate safety model | 8 |
+| Denylist veto, override clamping | 8 |
+| Private `DeletionCandidate` constructor | 8 |
+| Rule engine, macOS catalog, Linux/Windows seeds | 7 |
+| `~/Library/Containers` narrow-then-broad precedence | 7 (catalog), 12 (first-match) |
+| Traversal, permission collection, symlink refusal | 11 |
+| Full Disk Access reporting | 11, 13 |
+| Duplicate funnel | 14 |
+| Trash-only cleaner, journal, re-stat | 15 |
+| Console / JSON / Markdown / HTML reports | 13, 16 |
+| Reclaimable vs pending-review separation | 12, 13, 16 |
+| Configuration with accumulating validation | 6 |
+| CLI, dry-run default | 13 |
+| Diagnostics | 4 |
+| Testability via `FileSystemOps` | 5 |
+| Time Machine snapshots (open risk in spec) | 17 |
+| `node_modules` aggregate reporting | 7 |
+| `/Applications` report-only | 7, 8 |
+
+## Deferred deliberately
+
+- **Parallel traversal** — added in Task 17 only if measurement justifies it.
+- **Windows Recycle Bin** — `--delete` refuses on Windows rather than falling back to an irreversible unlink. Requires `SHFileOperation` P/Invoke.
+- **Squarified treemap** — Task 16 ships proportional bars; true squarification adds geometry for little gain at this scale.
+- **Unused-application detection** — `/Applications` is report-only by design; ranking by last-used date needs `mdls` and is not in v1.
