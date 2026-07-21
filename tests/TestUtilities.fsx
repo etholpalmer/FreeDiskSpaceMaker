@@ -97,3 +97,45 @@ let run () =
         let f (n: int) = Ok (n * 2)
         let values = assertOk (Result.traverse f [ 1; 2; 3 ]) "all succeed"
         assertEqual [ 2; 4; 6 ] values "values in order")
+
+    suite "Utilities.Glob"
+
+    test "star matches within a single segment only" (fun () ->
+        assertTrue (Glob.matches "*.log" "app.log") "star matches a basename"
+        assertTrue (Glob.matches "*.log" "a.log") "star matches short names"
+        assertFalse (Glob.matches "*.log" "dir/app.log") "star does not cross a separator"
+        assertFalse (Glob.matches "*.log" "app.txt") "extension must match")
+
+    test "question mark matches exactly one character" (fun () ->
+        assertTrue (Glob.matches "a?c" "abc") "single character"
+        assertFalse (Glob.matches "a?c" "ac") "zero characters does not match"
+        assertFalse (Glob.matches "a?c" "abbc") "two characters does not match"
+        assertFalse (Glob.matches "a?c" "a/c") "question mark does not match a separator")
+
+    test "double star crosses separators" (fun () ->
+        assertTrue (Glob.matches "**/*.log" "a/b/c.log") "deep match"
+        assertTrue (Glob.matches "**/*.log" "c.log") "double star matches zero directories"
+        assertTrue (Glob.matches "Containers/**" "Containers/a/b/c") "trailing double star"
+        assertTrue (Glob.matches "**" "anything/at/all") "bare double star matches everything")
+
+    test "literal patterns match exactly" (fun () ->
+        assertTrue (Glob.matches "DerivedData" "DerivedData") "exact literal"
+        assertFalse (Glob.matches "DerivedData" "DerivedDataX") "no implicit prefix match")
+
+    test "matching is case-insensitive on macOS and Windows" (fun () ->
+        // APFS is case-insensitive by default, so a rule written as "Caches"
+        // must still match a directory reported as "caches".
+        if Path.platformIsCaseInsensitive then
+            assertTrue (Glob.matches "*.LOG" "app.log") "case-insensitive on this platform"
+        else
+            assertFalse (Glob.matches "*.LOG" "app.log") "case-sensitive on this platform")
+
+    test "regex metacharacters in patterns are treated literally" (fun () ->
+        assertTrue (Glob.matches "a.b" "a.b") "dot is literal"
+        assertFalse (Glob.matches "a.b" "axb") "dot does not match any character"
+        assertTrue (Glob.matches "v1.0+build" "v1.0+build") "plus is literal")
+
+    test "matchesAny succeeds when any pattern matches" (fun () ->
+        assertTrue (Glob.matchesAny [ "*.tmp"; "*.log" ] "app.log") "second pattern matches"
+        assertFalse (Glob.matchesAny [ "*.tmp"; "*.log" ] "app.txt") "no pattern matches"
+        assertFalse (Glob.matchesAny [] "app.log") "empty pattern list matches nothing")

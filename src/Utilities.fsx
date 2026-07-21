@@ -154,3 +154,67 @@ module Result =
     /// Converts an exception-throwing thunk into a Result.
     let protect (onError: exn -> 'e) (f: unit -> 'a) : Result<'a, 'e> =
         try Ok (f ()) with ex -> Error (onError ex)
+
+/// Glob matching for rule include/exclude patterns.
+///
+/// Patterns are translated to anchored regular expressions and cached. The
+/// translation escapes every regex metacharacter, so a pattern like `v1.0+build`
+/// matches literally rather than being interpreted as a regex.
+module Glob =
+
+    open System.Collections.Concurrent
+    open System.Text.RegularExpressions
+
+    let private cache = ConcurrentDictionary<string * bool, Regex>()
+
+    /// Translates a glob pattern into an anchored regex source string.
+    ///
+    /// `**` crosses separators (and matches zero of them, so `**/x` matches a
+    /// bare `x`); `*` and `?` do not cross separators.
+    let private translate (pattern: string) : string =
+        let sb = StringBuilder()
+        sb.Append '^' |> ignore
+        let mutable i = 0
+        while i < pattern.Length do
+            match pattern.[i] with
+            | '*' when i + 1 < pattern.Length && pattern.[i + 1] = '*' ->
+                // `**/` should also match zero directories, so consume an
+                // optional following separator as part of the same group.
+                if i + 2 < pattern.Length && (pattern.[i + 2] = '/' || pattern.[i + 2] = '\\') then
+                    sb.Append "(?:.*[/\\\\])?" |> ignore
+                    i <- i + 3
+                else
+                    sb.Append ".*" |> ignore
+                    i <- i + 2
+            | '*' ->
+                sb.Append "[^/\\\\]*" |> ignore
+                i <- i + 1
+            | '?' ->
+                sb.Append "[^/\\\\]" |> ignore
+                i <- i + 1
+            | '/' | '\\' ->
+                sb.Append "[/\\\\]" |> ignore
+                i <- i + 1
+            | c ->
+                sb.Append(Regex.Escape(string c)) |> ignore
+                i <- i + 1
+        sb.Append '$' |> ignore
+        sb.ToString()
+
+    /// Compiles and caches the regex for a pattern.
+    let private regexFor (pattern: string) : Regex =
+        let key = (pattern, Path.platformIsCaseInsensitive)
+        cache.GetOrAdd(key, fun (p, insensitive) ->
+            let options =
+                if insensitive then RegexOptions.Compiled ||| RegexOptions.IgnoreCase
+                else RegexOptions.Compiled
+            Regex(translate p, options))
+
+    /// True when `path` matches `pattern`. Case sensitivity follows the platform.
+    let matches (pattern: string) (path: string) : bool =
+        (regexFor pattern).IsMatch path
+
+    /// True when `path` matches any of the supplied patterns.
+    /// An empty pattern list matches nothing.
+    let matchesAny (patterns: string list) (path: string) : bool =
+        patterns |> List.exists (fun p -> matches p path)
