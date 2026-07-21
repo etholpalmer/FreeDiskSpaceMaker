@@ -40,6 +40,7 @@
 #load "TestDuplicates.fsx"
 #load "TestDto.fsx"
 #load "TestCli.fsx"
+#load "TestFlagEffects.fsx"
 #load "TestCleaner.fsx"
 #load "TestReports.fsx"
 
@@ -56,6 +57,7 @@ TestScanner.run ()
 TestDuplicates.run ()
 TestDto.run ()
 TestCli.run ()
+TestFlagEffects.run ()
 TestCleaner.run ()
 TestReports.run ()
 
