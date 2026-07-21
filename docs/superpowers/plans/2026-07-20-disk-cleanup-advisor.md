@@ -3134,4 +3134,691 @@ than a silent clamp."
 
 ---
 
-**Remaining tasks (9–17) follow in the next section of this plan.**
+### Task 9: Report DTO layer
+
+**Files:**
+- Create: `src/Report/Dto.fsx`
+- Create: `tests/TestDto.fsx`
+- Modify: `tests/Tests.fsx`
+
+**Why this task exists:** `System.Text.Json` **throws `NotSupportedException` on F# discriminated unions**. This was confirmed empirically before writing this plan. Every DU must be projected to a primitive before serialization. This task builds that projection once so no later report module has to think about it.
+
+**Interfaces:**
+- Consumes: `Types`, `Utilities`
+- Produces:
+  - `Dto.FindingDto` = `{ Path: string; RuleName: string; Category: string; Risk: string; Recoverability: string; Strategy: string; SizeBytes: int64; AgeDays: float; SafeToDelete: bool; Reason: string }`
+  - `Dto.CategorySummaryDto` = `{ Category: string; ItemCount: int; TotalBytes: int64; ReclaimableBytes: int64 }`
+  - `Dto.ScanResultDto` = `{ GeneratedAtUtc: string; Platform: string; ScanRoots: string list; TotalItems: int; TotalBytes: int64; ReclaimableBytes: int64; PendingReviewBytes: int64; Categories: CategorySummaryDto list; Findings: FindingDto list; Errors: string list; UnreadableDirectoryCount: int; ElapsedSeconds: float }`
+  - `Dto.serializerOptions : JsonSerializerOptions`
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/TestDto.fsx`:
+
+```fsharp
+#load "TestFramework.fsx"
+#load "../src/Report/Dto.fsx"
+open System.Text.Json
+open TestFramework
+open Dto
+
+let run () =
+    suite "Report.Dto"
+
+    let sampleFinding =
+        { Path = "/testroot/a.log"
+          RuleName = "User Logs"
+          Category = "Logs"
+          Risk = "Safe"
+          Recoverability = "Regenerated"
+          Strategy = "ContentsOnly"
+          SizeBytes = 4096L
+          AgeDays = 12.5
+          SafeToDelete = true
+          Reason = "Diagnostic output." }
+
+    let sampleResult =
+        { GeneratedAtUtc = "2026-07-20T12:00:00Z"
+          Platform = "MacOS"
+          ScanRoots = [ "/testroot" ]
+          TotalItems = 1
+          TotalBytes = 4096L
+          ReclaimableBytes = 4096L
+          PendingReviewBytes = 0L
+          Categories = [ { Category = "Logs"; ItemCount = 1; TotalBytes = 4096L; ReclaimableBytes = 4096L } ]
+          Findings = [ sampleFinding ]
+          Errors = []
+          UnreadableDirectoryCount = 0
+          ElapsedSeconds = 1.25 }
+
+    test "a finding serializes without throwing" (fun () ->
+        // System.Text.Json throws NotSupportedException on F# discriminated
+        // unions. This test is the guard that keeps DUs out of the DTOs.
+        let json = JsonSerializer.Serialize(sampleFinding, serializerOptions)
+        assertContains "\"path\"" json "camelCase property naming"
+        assertContains "User Logs" json "rule name present")
+
+    test "a full scan result round-trips" (fun () ->
+        let json = JsonSerializer.Serialize(sampleResult, serializerOptions)
+        let restored = JsonSerializer.Deserialize<ScanResultDto>(json, serializerOptions)
+        assertEqual sampleResult.TotalBytes restored.TotalBytes "total bytes survive"
+        assertEqual 1 restored.Findings.Length "finding survives"
+        assertEqual "User Logs" (List.head restored.Findings).RuleName "rule name survives")
+
+    test "an empty scan result serializes" (fun () ->
+        let empty = { sampleResult with Findings = []; Categories = []; TotalItems = 0 }
+        let json = JsonSerializer.Serialize(empty, serializerOptions)
+        assertContains "\"findings\":[]" (json.Replace(" ", "")) "empty array, not null")
+
+    test "output is indented for human readability" (fun () ->
+        let json = JsonSerializer.Serialize(sampleResult, serializerOptions)
+        assertContains "\n" json "indented output contains newlines")
+```
+
+- [ ] **Step 2: Wire into the test entry point**
+
+Modify `tests/Tests.fsx` — add `#load "TestDto.fsx"` and `TestDto.run ()`.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: FAIL — cannot find `../src/Report/Dto.fsx`.
+
+- [ ] **Step 4: Write Dto.fsx**
+
+Create `src/Report/Dto.fsx`:
+
+```fsharp
+(**
+    Serialization-safe projections of the domain types.
+
+    System.Text.Json throws NotSupportedException on F# discriminated unions.
+    Rather than register custom converters for each one, every DU is projected
+    to a primitive string here, at a single boundary. The rule for this module
+    is absolute: **no field of any DTO may be a discriminated union.**
+
+    These records are also the JSON report's public contract, so their field
+    names are part of the tool's interface and should change only deliberately.
+*)
+module Dto
+
+open System
+open System.Text.Json
+open System.Text.Json.Serialization
+
+/// One reported item.
+type FindingDto =
+    { Path: string
+      RuleName: string
+      Category: string
+      Risk: string
+      Recoverability: string
+      Strategy: string
+      SizeBytes: int64
+      AgeDays: float
+      SafeToDelete: bool
+      Reason: string }
+
+/// Aggregate figures for one category.
+type CategorySummaryDto =
+    { Category: string
+      ItemCount: int
+      TotalBytes: int64
+      /// Bytes that passed all three gates and could be moved to Trash.
+      ReclaimableBytes: int64 }
+
+/// A complete scan, as written to the JSON report.
+type ScanResultDto =
+    { GeneratedAtUtc: string
+      Platform: string
+      ScanRoots: string list
+      TotalItems: int
+      TotalBytes: int64
+      /// Bytes eligible for automatic removal.
+      ReclaimableBytes: int64
+      /// Bytes surfaced for human judgment. Deliberately kept distinct from
+      /// ReclaimableBytes: conflating them would let a user believe space had
+      /// been freed when it had only been listed.
+      PendingReviewBytes: int64
+      Categories: CategorySummaryDto list
+      Findings: FindingDto list
+      Errors: string list
+      UnreadableDirectoryCount: int
+      ElapsedSeconds: float }
+
+/// Shared serializer settings: camelCase names, indented output, and no
+/// converters for DUs — because no DTO here contains one.
+let serializerOptions =
+    let options =
+        JsonSerializerOptions(
+            WriteIndented = true,
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            DefaultIgnoreCondition = JsonIgnoreCondition.Never)
+    options
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: PASS — 83 tests total.
+
+If `test "a finding serializes without throwing"` reports `NotSupportedException`, a DU has crept into a DTO field. Find it and replace it with its `toText` projection.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/Report/Dto.fsx tests/TestDto.fsx tests/Tests.fsx
+git commit -m "feat: add serialization-safe DTO layer
+
+System.Text.Json throws NotSupportedException on F# discriminated
+unions, so every DU is projected to a string at this single boundary.
+No DTO field may be a DU; the serialization test is the guard."
+```
+
+---
+
+### Task 10: FileClassifier
+
+**Files:**
+- Create: `src/FileClassifier.fsx`
+- Create: `tests/TestFileClassifier.fsx`
+- Modify: `tests/Tests.fsx`
+
+**Interfaces:**
+- Consumes: `Types`, `Utilities`
+- Produces:
+  - `FileClassifier.classify : string -> Category`
+  - `FileClassifier.isArchive : string -> bool`
+  - `FileClassifier.isDiskImage : string -> bool`
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/TestFileClassifier.fsx`:
+
+```fsharp
+#load "TestFramework.fsx"
+#load "../src/FileClassifier.fsx"
+open TestFramework
+open Types
+open FileClassifier
+
+let run () =
+    suite "FileClassifier"
+
+    test "archives are recognized by extension" (fun () ->
+        for name in [ "a.zip"; "a.tar"; "a.tar.gz"; "a.tgz"; "a.rar"; "a.7z"; "a.bz2" ] do
+            assertEqual Archives (classify ("/x/" + name)) (sprintf "%s is an archive" name))
+
+    test "disk images are recognized by extension" (fun () ->
+        for name in [ "a.dmg"; "a.iso"; "a.img"; "a.vmdk"; "a.qcow2" ] do
+            assertEqual DiskImages (classify ("/x/" + name)) (sprintf "%s is a disk image" name))
+
+    test "installers are recognized by extension" (fun () ->
+        for name in [ "a.pkg"; "a.msi"; "a.deb"; "a.rpm" ] do
+            assertEqual Installers (classify ("/x/" + name)) (sprintf "%s is an installer" name))
+
+    test "logs are recognized by extension and by rotation suffix" (fun () ->
+        assertEqual Logs (classify "/x/app.log") "plain log"
+        assertEqual Logs (classify "/x/app.log.1") "rotated log"
+        assertEqual Logs (classify "/x/app.log.gz") "compressed rotated log")
+
+    test "crash reports are recognized" (fun () ->
+        assertEqual CrashReports (classify "/x/App_2024-01-01.crash") "crash extension"
+        assertEqual CrashReports (classify "/x/App.ips") "ips extension")
+
+    test "temporary files are recognized" (fun () ->
+        assertEqual TemporaryFiles (classify "/x/a.tmp") "tmp extension"
+        assertEqual TemporaryFiles (classify "/x/a.temp") "temp extension"
+        assertEqual TemporaryFiles (classify "/x/~a.swp") "swap file")
+
+    test "path context overrides extension when a directory is decisive" (fun () ->
+        // A .log inside a cache directory is still cache, because the
+        // enclosing directory is the stronger signal about regenerability.
+        assertEqual Caches (classify "/Users/x/Library/Caches/app/debug.log") "cache directory wins"
+        assertEqual DeveloperArtifacts (classify "/Users/x/Library/Developer/Xcode/DerivedData/a/b.o") "DerivedData wins")
+
+    test "node_modules and __pycache__ are developer artifacts" (fun () ->
+        assertEqual DeveloperArtifacts (classify "/p/node_modules/left-pad/index.js") "node_modules"
+        assertEqual DeveloperArtifacts (classify "/p/__pycache__/mod.cpython-312.pyc") "__pycache__")
+
+    test "an unrecognized file falls through to Other" (fun () ->
+        assertEqual Other (classify "/x/notes.xyz") "unknown extension")
+
+    test "classification is case-insensitive" (fun () ->
+        assertEqual Archives (classify "/x/BACKUP.ZIP") "uppercase extension")
+
+    test "isArchive and isDiskImage agree with classify" (fun () ->
+        assertTrue (isArchive "/x/a.zip") "zip is an archive"
+        assertFalse (isArchive "/x/a.dmg") "dmg is not an archive"
+        assertTrue (isDiskImage "/x/a.dmg") "dmg is a disk image")
+```
+
+- [ ] **Step 2: Wire into the test entry point**
+
+Modify `tests/Tests.fsx` — add `#load "TestFileClassifier.fsx"` and `TestFileClassifier.run ()`.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: FAIL — cannot find `../src/FileClassifier.fsx`.
+
+- [ ] **Step 4: Write FileClassifier.fsx**
+
+Create `src/FileClassifier.fsx`:
+
+```fsharp
+(**
+    Classifies a path into a report category.
+
+    Directory context is checked before file extension, because the enclosing
+    directory is the stronger signal about regenerability: a `.log` inside
+    ~/Library/Caches is cache that will be regenerated, not a log worth keeping.
+
+    Classification is presentation only. It groups findings in reports and has
+    no bearing on whether anything may be deleted — that is entirely the risk
+    engine's decision.
+*)
+module FileClassifier
+
+open System
+
+#load "Types.fsx"
+#load "Utilities.fsx"
+open Types
+open Utilities
+
+/// Directory names that determine a category regardless of file extension.
+/// Ordered most specific first.
+let private decisiveDirectories =
+    [ "DerivedData", DeveloperArtifacts
+      "node_modules", DeveloperArtifacts
+      "__pycache__", DeveloperArtifacts
+      "CoreSimulator", DeveloperArtifacts
+      "CrashReporter", CrashReports
+      "DiagnosticReports", CrashReports
+      "Caches", Caches
+      "_cacache", PackageManagerCache
+      "Logs", Logs ]
+
+/// Extension groups. Compound extensions such as `.tar.gz` are handled by
+/// suffix matching rather than by Path.GetExtension, which returns only `.gz`.
+let private extensionGroups =
+    [ [ ".zip"; ".tar"; ".tar.gz"; ".tgz"; ".tar.bz2"; ".rar"; ".7z"; ".bz2"; ".xz" ], Archives
+      [ ".dmg"; ".iso"; ".img"; ".vmdk"; ".qcow2"; ".vdi"; ".sparseimage" ], DiskImages
+      [ ".pkg"; ".msi"; ".deb"; ".rpm"; ".exe" ], Installers
+      [ ".crash"; ".ips"; ".diag"; ".panic" ], CrashReports
+      [ ".tmp"; ".temp"; ".swp"; ".swo"; ".partial"; ".download" ], TemporaryFiles
+      [ ".log"; ".log.gz" ], Logs
+      [ ".o"; ".obj"; ".pyc"; ".class"; ".dSYM" ], DeveloperArtifacts ]
+
+/// True when the lowercase filename ends with any extension in the list.
+let private hasExtension (extensions: string list) (lowerName: string) : bool =
+    extensions |> List.exists (fun e -> lowerName.EndsWith(e, StringComparison.Ordinal))
+
+/// True when a filename is a rotated log such as `app.log.1`.
+let private isRotatedLog (lowerName: string) : bool =
+    let parts = lowerName.Split '.'
+    parts.Length >= 3
+    && parts.[parts.Length - 2] = "log"
+    && parts.[parts.Length - 1] |> Seq.forall Char.IsDigit
+
+/// Assigns a report category to a path.
+let classify (path: string) : Category =
+    let normalized = Utilities.Path.normalize path
+    let segments = Utilities.Path.segments normalized
+    let lowerName =
+        match List.tryLast segments with
+        | Some name -> name.ToLowerInvariant()
+        | None -> ""
+
+    // Directory context first — it is the stronger signal.
+    let fromDirectory =
+        decisiveDirectories
+        |> List.tryPick (fun (directoryName, category) ->
+            if segments |> List.exists (fun s -> String.Equals(s, directoryName, StringComparison.OrdinalIgnoreCase))
+            then Some category
+            else None)
+
+    match fromDirectory with
+    | Some category -> category
+    | None ->
+        if isRotatedLog lowerName then Logs
+        else
+            extensionGroups
+            |> List.tryPick (fun (extensions, category) ->
+                if hasExtension extensions lowerName then Some category else None)
+            |> Option.defaultValue Other
+
+/// True when the path names a compressed archive.
+let isArchive (path: string) : bool = classify path = Archives
+
+/// True when the path names a disk or virtual-machine image.
+let isDiskImage (path: string) : bool = classify path = DiskImages
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: PASS — 94 tests total.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/FileClassifier.fsx tests/TestFileClassifier.fsx tests/Tests.fsx
+git commit -m "feat: add file classifier for report grouping
+
+Directory context is checked before extension, since the enclosing
+directory is the stronger signal about regenerability. Classification
+is presentation only and has no bearing on deletability."
+```
+
+---
+
+### Task 11: DirectoryWalker
+
+**Files:**
+- Create: `src/DirectoryWalker.fsx`
+- Create: `tests/TestDirectoryWalker.fsx`
+- Modify: `tests/Tests.fsx`
+
+**Interfaces:**
+- Consumes: `Types`, `Utilities`, `Logging`, `Diagnostics`, `Platform`
+- Produces:
+  - `DirectoryWalker.WalkOptions` = `{ MaxDepth: int; ThreadCount: int; IgnorePaths: string list; FollowSymlinks: bool; StayOnVolume: bool }`
+  - `DirectoryWalker.defaultOptions : WalkOptions`
+  - `DirectoryWalker.WalkOutcome` = `{ Files: FileMeta list; Errors: FsError list }`
+  - `DirectoryWalker.walk : FileSystemOps -> Counters -> WalkOptions -> string -> WalkOutcome`
+
+**Design note:** the walker is written with a simple explicit stack rather than `Parallel.ForEachAsync` for the first implementation. Parallelism is added in Task 17 only if profiling on a real home directory shows it is worth the complexity. A correct sequential walker that ships beats a parallel one that races.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/TestDirectoryWalker.fsx`:
+
+```fsharp
+#load "TestFramework.fsx"
+#load "../src/DirectoryWalker.fsx"
+open TestFramework
+open Types
+open Platform
+open DirectoryWalker
+
+let private tree =
+    [ { Path = "/root"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+      { Path = "/root/a.log"; SizeBytes = 100L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
+      { Path = "/root/sub"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+      { Path = "/root/sub/b.log"; SizeBytes = 200L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
+      { Path = "/root/sub/deep"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+      { Path = "/root/sub/deep/c.log"; SizeBytes = 300L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
+      { Path = "/root/ignored"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+      { Path = "/root/ignored/d.log"; SizeBytes = 400L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
+      { Path = "/root/link"; SizeBytes = 0L; IsDirectory = true; LinkTarget = Some "/elsewhere"; ModifiedDaysAgo = 1.0 } ]
+
+let run () =
+    suite "DirectoryWalker"
+
+    let fs = FileSystem.inMemory tree
+
+    test "walks the full tree by default" (fun () ->
+        let counters = Diagnostics.create ()
+        let outcome = walk fs counters defaultOptions "/root"
+        let paths = outcome.Files |> List.map (fun f -> f.Path) |> List.sort
+        assertEqual 4 paths.Length "a.log, b.log, c.log, d.log"
+        assertTrue (paths |> List.contains "/root/sub/deep/c.log") "reaches the deepest file")
+
+    test "does not descend into symlinked directories" (fun () ->
+        // Following links risks infinite recursion and escaping the scan root.
+        let counters = Diagnostics.create ()
+        let outcome = walk fs counters defaultOptions "/root"
+        assertFalse (outcome.Files |> List.exists (fun f -> f.Path.Contains "elsewhere")) "link not followed"
+        assertEqual 1L (Diagnostics.snapshot counters).SkipsByReason.[Diagnostics.Symlink] "symlink skip recorded")
+
+    test "respects the depth limit" (fun () ->
+        let counters = Diagnostics.create ()
+        let outcome = walk fs counters { defaultOptions with MaxDepth = 1 } "/root"
+        let paths = outcome.Files |> List.map (fun f -> f.Path)
+        assertTrue (paths |> List.contains "/root/a.log") "depth 1 file included"
+        assertFalse (paths |> List.contains "/root/sub/deep/c.log") "depth 3 file excluded")
+
+    test "skips ignored paths" (fun () ->
+        let counters = Diagnostics.create ()
+        let options = { defaultOptions with IgnorePaths = [ "/root/ignored" ] }
+        let outcome = walk fs counters options "/root"
+        assertFalse (outcome.Files |> List.exists (fun f -> f.Path.Contains "ignored")) "ignored subtree excluded"
+        assertEqual 3 outcome.Files.Length "three remaining files")
+
+    test "counters reflect what was examined" (fun () ->
+        let counters = Diagnostics.create ()
+        walk fs counters defaultOptions "/root" |> ignore
+        let s = Diagnostics.snapshot counters
+        assertEqual 4L s.Files "four files counted"
+        assertEqual 1000L s.Bytes "summed sizes")
+
+    test "a missing root yields an error rather than throwing" (fun () ->
+        let counters = Diagnostics.create ()
+        let outcome = walk fs counters defaultOptions "/nonexistent"
+        assertEqual 0 outcome.Files.Length "no files"
+        assertEqual 1 outcome.Errors.Length "one error recorded"
+        assertEqual (PathNotFound "/nonexistent") (List.head outcome.Errors) "PathNotFound")
+
+    test "traversal continues past an unreadable subdirectory" (fun () ->
+        // Permission denial is the common case on macOS, not an edge case.
+        // A denial in one subtree must not abort the whole scan.
+        let denying =
+            { fs with
+                EnumerateFiles = fun path ->
+                    if path.Contains "sub" then Error (PermissionDenied path)
+                    else fs.EnumerateFiles path }
+        let counters = Diagnostics.create ()
+        let outcome = walk denying counters defaultOptions "/root"
+        assertTrue (outcome.Files |> List.exists (fun f -> f.Path = "/root/a.log")) "readable files still returned"
+        assertTrue (outcome.Errors |> List.exists (function PermissionDenied _ -> true | _ -> false)) "denial recorded")
+```
+
+- [ ] **Step 2: Wire into the test entry point**
+
+Modify `tests/Tests.fsx` — add `#load "TestDirectoryWalker.fsx"` and `TestDirectoryWalker.run ()`.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: FAIL — cannot find `../src/DirectoryWalker.fsx`.
+
+- [ ] **Step 4: Write DirectoryWalker.fsx**
+
+Create `src/DirectoryWalker.fsx`:
+
+```fsharp
+(**
+    Filesystem traversal with error collection.
+
+    Two properties matter more than speed here.
+
+    First, **errors are collected, never thrown**. On macOS, permission denial
+    is the common case: TCC blocks ~/Library/Containers, ~/Library/Mail, and
+    others unless the terminal has Full Disk Access. A denial in one subtree
+    must not abort the scan; it is recorded and traversal continues.
+
+    Second, **symlinks are never followed**. Following them risks unbounded
+    recursion through a cycle and, worse, escaping the scan root entirely —
+    which would let the risk engine evaluate paths the user never asked about.
+
+    Traversal uses an explicit stack rather than recursion, so a pathologically
+    deep tree cannot overflow the call stack.
+*)
+module DirectoryWalker
+
+open System
+open System.Collections.Generic
+
+#load "Types.fsx"
+#load "Utilities.fsx"
+#load "Logging.fsx"
+#load "Diagnostics.fsx"
+#load "Platform.fsx"
+open Types
+open Utilities
+
+/// Traversal settings.
+type WalkOptions =
+    { /// Maximum directory depth below the root. Bounds pathological trees.
+      MaxDepth: int
+      /// Reserved for the parallel implementation added in Task 17.
+      ThreadCount: int
+      /// Absolute paths whose subtrees are skipped entirely.
+      IgnorePaths: string list
+      /// Always false. Present to make the decision explicit and greppable
+      /// rather than implicit in the traversal code.
+      FollowSymlinks: bool
+      /// Whether to stop at a filesystem boundary, so a mounted volume or
+      /// network share is not pulled into a scan of the local disk.
+      StayOnVolume: bool }
+
+/// Sensible defaults: deep enough for real trees, bounded against pathological ones.
+let defaultOptions: WalkOptions =
+    { MaxDepth = 32
+      ThreadCount = min Environment.ProcessorCount 8
+      IgnorePaths = []
+      FollowSymlinks = false
+      StayOnVolume = true }
+
+/// What a traversal produced.
+type WalkOutcome =
+    { Files: FileMeta list
+      Errors: FsError list }
+
+/// Walks a directory tree, returning every file found and every error hit.
+///
+/// Never throws. Every failure is recorded in `Errors` and traversal continues
+/// with the next entry.
+let walk
+    (fs: Platform.FileSystemOps)
+    (counters: Diagnostics.Counters)
+    (options: WalkOptions)
+    (root: string)
+    : WalkOutcome =
+
+    let files = ResizeArray<FileMeta>()
+    let errors = ResizeArray<FsError>()
+
+    let ignored =
+        options.IgnorePaths |> List.map Utilities.Path.normalize
+
+    /// True when a path lies inside a configured ignore root.
+    let isIgnored (path: string) =
+        let normalized = Utilities.Path.normalize path
+        ignored |> List.exists (fun i ->
+            Utilities.Path.equals i normalized || Utilities.Path.isDescendantOf i normalized)
+
+    let rootVolume =
+        if options.StayOnVolume then
+            match fs.VolumeOf root with
+            | Ok volume -> Some volume
+            | Error _ -> None
+        else None
+
+    /// True when a directory sits on a different filesystem than the root.
+    let crossesVolume (path: string) =
+        match rootVolume with
+        | None -> false
+        | Some expected ->
+            match fs.VolumeOf path with
+            | Ok actual -> actual <> expected
+            | Error _ -> false
+
+    if not (fs.Exists root) then
+        { Files = []; Errors = [ PathNotFound root ] }
+    else
+        // Explicit stack of (directory, depth) so deep trees cannot overflow.
+        let pending = Stack<string * int>()
+        pending.Push(root, 0)
+
+        while pending.Count > 0 do
+            let directory, depth = pending.Pop()
+            Diagnostics.recordDirectory counters
+
+            // Files in this directory.
+            match fs.EnumerateFiles directory with
+            | Error e -> errors.Add e
+            | Ok found ->
+                for path in found do
+                    if isIgnored path then
+                        Diagnostics.recordSkip counters Diagnostics.Excluded
+                    else
+                        match fs.GetInfo path with
+                        | Error e -> errors.Add e
+                        | Ok meta ->
+                            if FileMeta.isLink meta then
+                                Diagnostics.recordSkip counters Diagnostics.Symlink
+                            else
+                                files.Add meta
+                                Diagnostics.recordFile counters meta.SizeBytes
+
+            // Subdirectories, queued for a later iteration.
+            if depth >= options.MaxDepth then
+                Diagnostics.recordSkip counters Diagnostics.DepthLimit
+            else
+                match fs.EnumerateDirectories directory with
+                | Error e -> errors.Add e
+                | Ok found ->
+                    for path in found do
+                        if isIgnored path then
+                            Diagnostics.recordSkip counters Diagnostics.Excluded
+                        else
+                            match fs.GetInfo path with
+                            | Error e -> errors.Add e
+                            | Ok meta ->
+                                if FileMeta.isLink meta then
+                                    Diagnostics.recordSkip counters Diagnostics.Symlink
+                                elif crossesVolume path then
+                                    Diagnostics.recordSkip counters Diagnostics.FilesystemBoundary
+                                else
+                                    pending.Push(path, depth + 1)
+
+        { Files = List.ofSeq files; Errors = List.ofSeq errors }
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: PASS — 101 tests total.
+
+- [ ] **Step 6: Walk a real directory to confirm behavior on disk**
+
+```bash
+cat > /tmp/walkprobe.fsx <<'EOF'
+#load "src/DirectoryWalker.fsx"
+let fs = Platform.FileSystem.real
+let counters = Diagnostics.create ()
+let target = System.IO.Path.Combine(Platform.home (), "Library/Caches")
+let outcome = DirectoryWalker.walk fs counters { DirectoryWalker.defaultOptions with MaxDepth = 3 } target
+printfn "files=%d errors=%d" outcome.Files.Length outcome.Errors.Length
+printfn "%s" (Diagnostics.render (Diagnostics.snapshot counters))
+EOF
+dotnet fsi /tmp/walkprobe.fsx && rm /tmp/walkprobe.fsx
+```
+
+Expected: a non-zero file count and a diagnostics block. A non-zero error count is normal and expected — it reflects TCC-protected subdirectories. The important property is that the walk **completes** despite them.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/DirectoryWalker.fsx tests/TestDirectoryWalker.fsx tests/Tests.fsx
+git commit -m "feat: add directory walker with error collection
+
+Errors are collected rather than thrown, because permission denial is
+the common case on macOS under TCC and must not abort a scan.
+Symlinks are never followed — that would risk cycles and escaping the
+scan root. Traversal uses an explicit stack so deep trees cannot
+overflow."
+```
+
+---
+
+**Remaining tasks (12–17) follow in the next section of this plan.**
