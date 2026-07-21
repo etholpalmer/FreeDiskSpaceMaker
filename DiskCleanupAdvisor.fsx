@@ -27,6 +27,7 @@
 #load "src/Report/Json.fsx"
 #load "src/Report/Console.fsx"
 #load "src/Cli.fsx"
+#load "src/Cleaner.fsx"
 
 open System
 
@@ -96,11 +97,49 @@ let private main () : int =
         printfn "%s" Cli.helpText
         0
     | Cli.Delete ->
-        // Cleaner does not exist yet (Task 15). Until it does, the tool is
-        // structurally incapable of modifying anything, so --delete is
-        // refused explicitly rather than silently ignored.
-        eprintfn "--delete is not yet implemented. Run without it to scan."
-        1
+        let log = Logging.create (if options.Verbose then Logging.Debug else Logging.Info)
+        if Platform.isElevated () && not options.AllowRoot then
+            fail [ "refusing to run with elevated privileges; pass --allow-root to override" ]
+        else
+        match Configuration.load Platform.FileSystem.real options.ConfigPath with
+        | Error errors -> fail errors
+        | Ok config ->
+            let config = mergeOptions options config
+            let fs = Platform.FileSystem.real
+            let rules = Rules.resolveAll fs (Platform.current ())
+            match Scanner.scan fs config options.Force rules with
+            | Error errors -> fail errors
+            | Ok result ->
+                printf "%s" (Report.Console.render result)
+                let candidates = result.Findings |> List.choose (fun f -> f.Candidate)
+                if List.isEmpty candidates then
+                    printfn "Nothing is eligible for automatic removal."
+                    0
+                else
+                    let total = candidates |> List.sumBy RiskEngine.candidateSize
+                    printfn ""
+                    printfn "About to move %d items (%s) to the Trash."
+                        candidates.Length (Utilities.Format.bytes total)
+                    printfn "They can be restored from the Trash until you empty it."
+                    printf  "Type 'yes' to continue: "
+                    match Console.ReadLine() with
+                    | "yes" ->
+                        let journal = Cleaner.journalPath DateTime.Now
+                        match Cleaner.writeJournal journal candidates with
+                        | Error e -> fail [ e ]
+                        | Ok () ->
+                            let outcome = Cleaner.moveToTrash fs log candidates
+                            printfn ""
+                            printfn "Moved %d items (%s) to the Trash."
+                                outcome.Moved.Length (Utilities.Format.bytes outcome.BytesMoved)
+                            // Stated plainly: the space is not back yet.
+                            printfn "Empty the Trash to actually reclaim this space."
+                            if not (List.isEmpty outcome.Failed) then
+                                printfn "%d items could not be moved; see %s" outcome.Failed.Length journal
+                            0
+                    | _ ->
+                        printfn "Cancelled. Nothing was modified."
+                        0
     | Cli.Scan ->
         let log =
             Logging.create (if options.Verbose then Logging.Debug else Logging.Info)

@@ -22,6 +22,7 @@
 #load "../src/Report/Json.fsx"
 #load "../src/Report/Console.fsx"
 #load "../src/Cli.fsx"
+#load "../src/Cleaner.fsx"
 #load "TestFramework.fsx"
 #load "TestTypes.fsx"
 #load "TestUtilities.fsx"
@@ -36,6 +37,7 @@
 #load "TestDuplicates.fsx"
 #load "TestDto.fsx"
 #load "TestCli.fsx"
+#load "TestCleaner.fsx"
 
 TestTypes.run ()
 TestUtilities.run ()
@@ -50,5 +52,6 @@ TestScanner.run ()
 TestDuplicates.run ()
 TestDto.run ()
 TestCli.run ()
+TestCleaner.run ()
 
 exit (TestFramework.report ())
