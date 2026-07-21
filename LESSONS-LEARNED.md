@@ -217,7 +217,7 @@ The first three were recoverable with better unit fixtures. The last three requi
 
 **Prevention:** Treat "flag documented in help text" as a testable claim. A CLI flag that does nothing is worse than an absent one, because the help text manufactures false confidence — here, a user running `--age 90 --delete` would believe they had narrowed the deletion set and get the full set.
 
-**Active mitigation:** `tests/TestCli.fsx` asserts `--threads` is absent. A stronger mitigation — asserting each remaining flag changes some observable output — is listed as an open gap.
+**Active mitigation:** `tests/TestFlagEffects.fsx` (commit `fef597f`) asserts every behavioural flag changes scan results in the stated direction, and a coverage guard fails if a flag is added to `Cli.helpText` without declared coverage. Mutation-tested: reintroducing this exact defect fails the suite.
 
 **Time Lost:** ~30 minutes to wire, plus a self-inflicted false alarm (below).
 
@@ -266,25 +266,6 @@ The first three were recoverable with better unit fixtures. The last three requi
 ---
 
 ## Solution Gaps
-
-### 2026-07-21 — No test proves a CLI flag has an observable effect
-
-**Current State:** `tests/TestCli.fsx` asserts flags *parse* into the right `Options` fields, and that `--threads` is gone.
-
-**Limitation:** Parsing correctness is not effect correctness. Six flags parsed perfectly for an entire task cycle while doing nothing, and the existing tests stayed green throughout.
-
-**Ideal Solution:** A test per behavioural flag that runs a scan over an in-memory tree twice — once with, once without — and asserts the results differ in the expected direction.
-
-**Closing this gap requires:**
-1. A helper that runs `Scanner.scan` with a given `Config` over a fixed in-memory tree — half an hour — **pending**
-2. Assertions for `--age`, `--min-size`, `--duplicates`, `--large-files`, `--hash-algorithm` — an hour — **pending**
-3. A guard test asserting every flag in `Cli.helpText` maps to a consumed field — an hour, needs a naming convention to be mechanical — **pending**
-
-**Priority:** High — this is the only gap that let a safety-relevant defect ship.
-
-**Related:** Mistakes — "Six CLI flags parsed but never consumed".
-
----
 
 ### 2026-07-21 — Cleaner's pre-move recheck verifies size only
 
@@ -382,6 +363,16 @@ The first three were recoverable with better unit fixtures. The last three requi
 
 > Entries moved here when the underlying condition no longer applies.
 > Kept for historical context.
+
+### Archived 2026-07-21 — No test proved a CLI flag had an observable effect
+
+**Resolution:** Commit `fef597f`. `tests/TestFlagEffects.fsx` runs the same in-memory fixture twice for each behavioural flag, with and without, and asserts the results differ in the stated direction. `--age` and `--min-size` additionally assert zero is a no-op, so the defaults cannot silently begin filtering. `--duplicates` asserts the reclaimable total and candidate count are identical with and without detection — the safety property for that flag. A coverage guard parses `Cli.helpText` and fails on any unclassified flag, or any classified flag no longer documented.
+
+**Mutation-tested both directions:** reintroducing the inert `--age` (replacing `config.AgeThresholdDays` with `0`) failed 2 tests; adding an unwired `--brand-new` flag to the help text failed the guard with the message *"help text documents flags with no declared coverage: [\"--brand-new\"]"*. A guard that cannot fail is decoration, so this was verified rather than assumed.
+
+**Original limitation:** the suite asserted only that flags *parsed* into the right `Options` field. Six flags parsed perfectly for an entire task cycle while doing nothing, and the tests stayed green throughout.
+
+---
 
 ### Archived 2026-07-21 — Exceptions escaped `moveToTrash` after the journal was written
 
