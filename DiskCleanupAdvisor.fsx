@@ -21,6 +21,8 @@
 #load "src/FileClassifier.fsx"
 #load "src/DirectoryWalker.fsx"
 #load "src/Scanner.fsx"
+#load "src/Hashing.fsx"
+#load "src/Duplicates.fsx"
 #load "src/Report/Dto.fsx"
 #load "src/Report/Json.fsx"
 #load "src/Report/Console.fsx"

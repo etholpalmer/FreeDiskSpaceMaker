@@ -16,6 +16,8 @@
 #load "../src/FileClassifier.fsx"
 #load "../src/DirectoryWalker.fsx"
 #load "../src/Scanner.fsx"
+#load "../src/Hashing.fsx"
+#load "../src/Duplicates.fsx"
 #load "../src/Report/Dto.fsx"
 #load "../src/Report/Json.fsx"
 #load "../src/Report/Console.fsx"
@@ -31,6 +33,7 @@
 #load "TestFileClassifier.fsx"
 #load "TestDirectoryWalker.fsx"
 #load "TestScanner.fsx"
+#load "TestDuplicates.fsx"
 #load "TestDto.fsx"
 #load "TestCli.fsx"
 
@@ -44,6 +47,7 @@ TestRiskEngine.run ()
 TestFileClassifier.run ()
 TestDirectoryWalker.run ()
 TestScanner.run ()
+TestDuplicates.run ()
 TestDto.run ()
 TestCli.run ()
 
