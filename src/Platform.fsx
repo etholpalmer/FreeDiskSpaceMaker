@@ -100,13 +100,22 @@ module FileSystem =
         | e -> IoFailure(path, e.Message)
 
     /// Enumeration settings shared by the real implementation.
+    ///
     /// IgnoreInaccessible lets a partially-readable directory still yield its
     /// readable entries instead of failing wholesale.
+    ///
+    /// AttributesToSkip must be None. The .NET default is `Hidden ||| System`,
+    /// and on Unix every dotfile carries the Hidden attribute — so the default
+    /// silently skips `.nuget`, `.npm`, `.cache`, `.gradle`, `.m2`, `.yarn`,
+    /// `.local` and `.Trash`, which is most of what this tool exists to find.
+    /// Measured on macOS: the default returned 53 of 118 directories in a home
+    /// directory, and `~/.nuget/packages` (5.2 GB) reported zero findings.
     let private enumerationOptions =
         EnumerationOptions(
             IgnoreInaccessible = true,
             RecurseSubdirectories = false,
-            ReturnSpecialDirectories = false)
+            ReturnSpecialDirectories = false,
+            AttributesToSkip = FileAttributes.None)
 
     /// The real filesystem.
     let real: FileSystemOps =

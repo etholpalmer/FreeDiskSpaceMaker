@@ -70,3 +70,22 @@ let run () =
         let meta = assertOk (fs.GetInfo "/root/sub/c.log") "get aged file"
         let age = FileMeta.age DateTime.UtcNow meta
         assertTrue (age.TotalDays > 89.0 && age.TotalDays < 91.0) "roughly 90 days old")
+
+    test "the real filesystem enumerates hidden dot-directories" (fun () ->
+        // .NET's EnumerationOptions defaults to AttributesToSkip = Hidden|System,
+        // and on Unix every dotfile is Hidden. Under that default the walker
+        // silently skipped ~/.nuget, ~/.npm, ~/.cache and friends — most of what
+        // this tool exists to find. Measured: ~/.nuget/packages (5.2 GB) reported
+        // zero findings until AttributesToSkip was set to None.
+        let root = IO.Path.Combine(IO.Path.GetTempPath(), "dcahidden")
+        if IO.Directory.Exists root then IO.Directory.Delete(root, true)
+        IO.Directory.CreateDirectory(IO.Path.Combine(root, ".hidden")) |> ignore
+        IO.File.WriteAllText(IO.Path.Combine(root, ".hidden", "f.txt"), "x")
+        try
+            let dirs = assertOk (FileSystem.real.EnumerateDirectories root) "enumerate"
+            assertTrue (dirs |> Array.exists (fun d -> d.EndsWith ".hidden"))
+                "a dot-directory must be enumerated, not skipped as Hidden"
+            let files = assertOk (FileSystem.real.EnumerateFiles (IO.Path.Combine(root, ".hidden"))) "files"
+            assertEqual 1 files.Length "files inside a dot-directory are reachable"
+        finally
+            IO.Directory.Delete(root, true))
