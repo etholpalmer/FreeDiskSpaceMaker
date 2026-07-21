@@ -30,7 +30,8 @@ let private testRule name root risk safeToDelete includes : Rule =
       Category = Caches }
 
 let private tree =
-    [ { Path = "/cache"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+    [ { Path = "/"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+      { Path = "/cache"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
       { Path = "/cache/a.tmp"; SizeBytes = 1000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
       { Path = "/cache/b.tmp"; SizeBytes = 2000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 60.0 }
       { Path = "/data"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
@@ -110,6 +111,59 @@ let run () =
         let grouped = byCategory result
         assertEqual 1 grouped.Length "one non-empty category"
         assertEqual 2 (snd (List.head grouped)).Length "two findings in it")
+
+    test "nested roots do not double-count a file" (fun () ->
+        let nestedTree =
+            [ { Path = "/outer"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+              { Path = "/outer/inner"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+              { Path = "/outer/inner/f.tmp"; SizeBytes = 500L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 } ]
+        let nestedFs = FileSystem.inMemory nestedTree
+        let rules : ResolvedRule list =
+            [ { Rule = testRule "Outer" "/outer" Safe true []; Root = "/outer" }
+              { Rule = testRule "Inner" "/outer/inner" Safe true []; Root = "/outer/inner" } ]
+        let result = assertOk (scan nestedFs config false rules) "scan succeeds"
+        let matches = result.Findings |> List.filter (fun f -> f.Meta.Path = "/outer/inner/f.tmp")
+        assertEqual 1 matches.Length "the file is reported exactly once")
+
+    test "nested roots do not inflate reclaimable bytes" (fun () ->
+        let nestedTree =
+            [ { Path = "/outer"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+              { Path = "/outer/inner"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+              { Path = "/outer/inner/f.tmp"; SizeBytes = 500L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 } ]
+        let nestedFs = FileSystem.inMemory nestedTree
+        let rules : ResolvedRule list =
+            [ { Rule = testRule "Outer" "/outer" Safe true []; Root = "/outer" }
+              { Rule = testRule "Inner" "/outer/inner" Safe true []; Root = "/outer/inner" } ]
+        let result = assertOk (scan nestedFs config false rules) "scan succeeds"
+        assertEqual 500L (reclaimableBytes result) "the file's size is counted exactly once")
+
+    test "nested-root deduplication does not lose coverage" (fun () ->
+        let nestedTree =
+            [ { Path = "/outer"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+              { Path = "/outer/shallow.tmp"; SizeBytes = 100L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
+              { Path = "/outer/inner"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+              { Path = "/outer/inner/deep.tmp"; SizeBytes = 500L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 } ]
+        let nestedFs = FileSystem.inMemory nestedTree
+        let rules : ResolvedRule list =
+            [ { Rule = testRule "Outer" "/outer" Safe true []; Root = "/outer" }
+              { Rule = testRule "Inner" "/outer/inner" Safe true []; Root = "/outer/inner" } ]
+        let result = assertOk (scan nestedFs config false rules) "scan succeeds"
+        assertTrue (result.Findings |> List.exists (fun f -> f.Meta.Path = "/outer/shallow.tmp")) "the shallow file is still found"
+        assertTrue (result.Findings |> List.exists (fun f -> f.Meta.Path = "/outer/inner/deep.tmp")) "the file only present under the deeper root is still found")
+
+    test "sibling non-nested roots are both walked" (fun () ->
+        let siblingTree =
+            [ { Path = "/a"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+              { Path = "/a/one.tmp"; SizeBytes = 100L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
+              { Path = "/b"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+              { Path = "/b/two.tmp"; SizeBytes = 200L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 } ]
+        let siblingFs = FileSystem.inMemory siblingTree
+        let rules : ResolvedRule list =
+            [ { Rule = testRule "A" "/a" Safe true []; Root = "/a" }
+              { Rule = testRule "B" "/b" Safe true []; Root = "/b" } ]
+        let result = assertOk (scan siblingFs config false rules) "scan succeeds"
+        assertTrue (result.Findings |> List.exists (fun f -> f.Meta.Path = "/a/one.tmp")) "sibling A's file is found"
+        assertTrue (result.Findings |> List.exists (fun f -> f.Meta.Path = "/b/two.tmp")) "sibling B's file is found")
 
     test "walk errors are carried into the result" (fun () ->
         let denying = { fs with EnumerateFiles = fun p -> Error (PermissionDenied p) }

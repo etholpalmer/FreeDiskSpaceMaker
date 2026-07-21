@@ -83,6 +83,12 @@ let private firstMatch
 
 /// Runs a scan over every resolved rule root.
 ///
+/// Roots that are nested inside another root are walked only once, from the
+/// outermost ancestor — walking a broad root already visits everything
+/// beneath a narrower one, so keeping both would report the same files
+/// twice. `ScanResult.ScanRoots` reflects the roots actually walked after
+/// this filtering.
+///
 /// `allowProbablySafe` corresponds to --force and widens only the risk gate.
 /// Returns Error when configuration overrides are invalid, because continuing
 /// would apply a risk policy the user did not actually get.
@@ -118,10 +124,23 @@ let scan
             DirectoryWalker.IgnorePaths = config.IgnorePaths }
 
     // Distinct roots, so two rules sharing a root do not walk it twice.
-    let roots =
+    let distinctRoots =
         effectiveRules
         |> List.map (fun r -> r.Root)
         |> List.distinct
+
+    // Drop any root that is a descendant of another root in the list.
+    // Walking the outermost root already visits every file beneath a nested
+    // root, so keeping the nested root too would walk (and report) those
+    // files twice. Rule matching is unaffected: `firstMatch` still tests
+    // every rule in precedence order against every file, regardless of
+    // which root the walk found it under.
+    let roots =
+        distinctRoots
+        |> List.filter (fun candidate ->
+            distinctRoots
+            |> List.forall (fun other ->
+                other = candidate || not (Utilities.Path.isDescendantOf other candidate)))
 
     let outcomes = roots |> List.map (DirectoryWalker.walk fs counters walkOptions)
 
@@ -156,6 +175,11 @@ let scan
                       Strategy = rule.Strategy
                       Reason = rule.Reason
                       Candidate = candidate })
+        // Defensive second layer: root de-duplication should already make
+        // this a no-op, but if the same path were ever produced twice, keep
+        // only the first occurrence (the highest-precedence match, since
+        // rules are precedence-sorted) and preserve relative order.
+        |> List.distinctBy (fun f -> Utilities.Path.normalize f.Meta.Path)
 
     Ok
         { GeneratedAtUtc = now
