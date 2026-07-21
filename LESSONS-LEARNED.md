@@ -28,6 +28,8 @@
 
 **Active mitigation:** `tests/TestPlatform.fsx` contains a regression test that `chmod 000`s a directory and asserts `EnumerateFiles` returns `Error (PermissionDenied _)`, not `Ok`. It fails if the flag is ever flipped back. The same test asserts a readable sibling still enumerates, so the fix cannot be undone by "restoring" partial-read behaviour.
 
+**Resolution (2026-07-21):** Commit `5516746` fixed the underlying flag; commit `da6349a` closed the two related Cleaner/elevation gaps found in the same review. The reasoning here — that a dev machine's privileges determine which branches are reachable at all — is a **permanent** lesson and stays active regardless.
+
 **Meta-pattern to hunt for:** *environment-privileged blindness*. When reviewing any code with a permission, quota, network, or capability branch, ask which branch the dev machine can actually reach. If the answer is "only the happy one", the unhappy branch is untested regardless of what the suite says.
 
 **Related:** Mistakes — "Permission denial silently swallowed"; Lesson — "Fixing one bug can expose a latent one".
@@ -301,35 +303,6 @@ The first three were recoverable with better unit fixtures. The last three requi
 
 ---
 
-### 2026-07-21 — Exceptions escape `moveToTrash` after the journal is written
-
-**Current State:** `Directory.CreateDirectory trash` (`src/Cleaner.fsx:110`) and the `Exists` probes inside `uniqueDestination` (`:129`) sit outside the `try` beginning at `:130`.
-
-**Limitation:** `moveToTrash` is typed to return `TrashResult` and documented as collecting failures, but a read-only home or a permission failure on `~/.Trash` throws straight out — *after* the journal is written and *after* the user typed `yes`. The user sees a confirmation, then an FSI stack trace, with no summary of what did or did not move.
-
-**Closing this gap requires:**
-1. Wrap both call sites and fold failures into `TrashResult.Failed` — 20 minutes — **pending**
-
-**Priority:** Medium — no data loss, but the failure lands at the moment of maximum user anxiety.
-
----
-
-### 2026-07-21 — `Platform.isElevated` is weaker than advertised
-
-**Current State:** Checks `USER = "root"` and the presence of `SUDO_USER` (`src/Platform.fsx:47-50`). The comment claims "getuid() returns 0 for root", which the code does not do.
-
-**Limitation:** Defeated by `su -`, a root launchd/cron context, or `env -u USER`. `--help` advertises refusal-to-run-elevated as a safety property.
-
-**Mitigating factor:** The denylist veto protects `/System`, `/Applications`, `/etc` regardless of elevation, so this is not a data-loss path.
-
-**Closing this gap requires:**
-1. Correct the comment to describe the heuristic honestly — 5 minutes — **pending**
-2. Add a `HOME = "/var/root"` check — 10 minutes — **pending**
-
-**Priority:** Low.
-
----
-
 ### 2026-07-21 — Time Machine snapshot reporting never ran against a live snapshot
 
 **Current State:** `src/Snapshots.fsx` parses `tmutil listlocalsnapshots /` and renders advice.
@@ -410,4 +383,18 @@ The first three were recoverable with better unit fixtures. The last three requi
 > Entries moved here when the underlying condition no longer applies.
 > Kept for historical context.
 
-_(none yet)_
+### Archived 2026-07-21 — Exceptions escaped `moveToTrash` after the journal was written
+
+**Resolution:** Commit `da6349a`. Trash preparation now returns a `TrashResult` listing every candidate as failed rather than throwing, and destination selection moved inside the per-candidate guard. Verified by deleting a source file between minting its candidate and the move: `moved=0 failed=1`, no exception. The reasoning — *a failure occurring after the user has committed to an action must surface as data, not as a stack trace* — stays active as a design principle.
+
+**Original limitation:** `Directory.CreateDirectory trash` and the `Exists` probes inside `uniqueDestination` sat outside the `try`. Both ran after the journal was written and after the user typed `yes`, so an escaping exception replaced the promised summary with a stack trace and abandoned the remaining candidates unreported.
+
+---
+
+### Archived 2026-07-21 — `Platform.isElevated` was weaker than advertised
+
+**Resolution:** Commit `da6349a`. Now uses `Environment.UserName`, which .NET resolves from the effective uid on Unix — verified to still return the real user under `env -u USER`, the exact bypass the review flagged — plus a `/var/root` home check and the existing `SUDO_USER` test. The comment now describes the heuristic honestly and records that the denylist veto protects system paths regardless of privilege. The reasoning — *a comment claiming a stronger check than the code performs is worse than no comment, because it stops reviewers looking* — stays active.
+
+**Original limitation:** The comment claimed "getuid() returns 0 for root" but the code only compared the `USER` environment variable, defeated by `su -`, a root launchd context, or `env -u USER`.
+
+---
