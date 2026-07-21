@@ -37,7 +37,7 @@ let private riskBadge (level: RiskLevel) =
 let private rule () = String.replicate 72 "─"
 
 /// Renders the complete console report.
-let render (result: Scanner.ScanResult) : string =
+let render (snapshots: Snapshots.LocalSnapshot list) (result: Scanner.ScanResult) : string =
     let sb = StringBuilder()
     let append (text: string) = sb.AppendLine text |> ignore
 
@@ -103,6 +103,15 @@ let render (result: Scanner.ScanResult) : string =
         append (colorize "\027[33m" (sprintf "  %d directories were unreadable." unreadable))
         append (colorize dim "  Grant Full Disk Access to your terminal in System Settings →")
         append (colorize dim "  Privacy & Security to include them in the scan.")
+        append ""
+
+    // Time Machine snapshots — reported because no file deletion reclaims
+    // them, and a user who frees caches but sees no free-space change has
+    // been misled if this is left unmentioned.
+    let snapshotAdvice = Snapshots.renderAdvice snapshots
+    if snapshotAdvice <> "" then
+        append (colorize bold "Time Machine")
+        append snapshotAdvice
         append ""
 
     if reclaimable > 0L then

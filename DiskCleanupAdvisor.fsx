@@ -25,6 +25,7 @@
 #load "src/Duplicates.fsx"
 #load "src/Report/Dto.fsx"
 #load "src/Report/Json.fsx"
+#load "src/Snapshots.fsx"
 #load "src/Report/Console.fsx"
 #load "src/Report/Markdown.fsx"
 #load "src/Report/Html.fsx"
@@ -68,8 +69,15 @@ let private runScan (options: Cli.Options) (config: Configuration.Config) (log: 
     | Ok result ->
         log |> Logging.info (sprintf "scan complete: %d findings" result.Findings.Length)
 
+        let snapshots =
+            match Snapshots.list () with
+            | Ok found -> found
+            | Error message ->
+                log |> Logging.warn message
+                []
+
         // Console output always.
-        printf "%s" (Report.Console.render result)
+        printf "%s" (Report.Console.render snapshots result)
 
         // File reports on request. A write failure is reported but does not
         // discard the scan that already succeeded.
@@ -124,7 +132,13 @@ let private main () : int =
             match Scanner.scan fs config options.Force rules with
             | Error errors -> fail errors
             | Ok result ->
-                printf "%s" (Report.Console.render result)
+                let snapshots =
+                    match Snapshots.list () with
+                    | Ok found -> found
+                    | Error message ->
+                        log |> Logging.warn message
+                        []
+                printf "%s" (Report.Console.render snapshots result)
                 let candidates = result.Findings |> List.choose (fun f -> f.Candidate)
                 if List.isEmpty candidates then
                     printfn "Nothing is eligible for automatic removal."

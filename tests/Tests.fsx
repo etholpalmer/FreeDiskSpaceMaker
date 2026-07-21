@@ -20,6 +20,7 @@
 #load "../src/Duplicates.fsx"
 #load "../src/Report/Dto.fsx"
 #load "../src/Report/Json.fsx"
+#load "../src/Snapshots.fsx"
 #load "../src/Report/Console.fsx"
 #load "../src/Report/Markdown.fsx"
 #load "../src/Report/Html.fsx"
