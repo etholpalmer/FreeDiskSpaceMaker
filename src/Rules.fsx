@@ -282,16 +282,16 @@ let private macOsRules: Rule list =
           Risk = Review
           Recoverability = Unrecoverable
           Description = "Docker Desktop's virtual machine disk image, holding all images, volumes, and containers."
-          Reason = "This is a single large sparse file containing every Docker volume, including databases a developer may depend on. Use `docker system prune` instead, which understands what is safe to remove. Reported, never deleted."
-          EstimatedBenefit = "reported only"
+          Reason = "This is a single large sparse file containing every Docker volume, including databases a developer may depend on. Use `docker system prune` instead, which understands what is safe to remove — and unlike Podman, Docker Desktop does return the freed blocks to macOS, so the prune genuinely shrinks this file. Reported, never deleted."
+          EstimatedBenefit = "reported only — and the size shown is the image's apparent size, which for a sparse file overstates the blocks actually in use"
           Examples = [ "~/Library/Containers/com.docker.docker/Data/vms/0/data" ] }
 
       { rule "Podman Machine Images" [ MacOS ] (HomeRelative ".local/share/containers/podman") VirtualMachines with
           Risk = Review
           Recoverability = Unrecoverable
-          Description = "Podman virtual machine images."
-          Reason = "Contains container volumes and machine state. Use `podman system prune` instead."
-          EstimatedBenefit = "reported only"
+          Description = "Podman virtual machine images, including any left behind after uninstalling Podman."
+          Reason = "A sparse disk image holding the whole Linux guest: container volumes, images and machine state. Note that `podman system prune` will NOT reclaim this — it cleans up inside the guest, so it does nothing while the machine is stopped, and even a successful prune leaves the host file the same size because freeing blocks inside a sparse image does not return them to macOS. Reclaiming the space means removing the machine itself with `podman machine rm <name>`, which destroys the guest filesystem and every volume in it. This directory also survives an uninstall: the official .pkg installs to /opt/podman, which Homebrew and Podman Desktop removal do not touch. Reported, never deleted."
+          EstimatedBenefit = "reported only — and the size shown is the image's apparent size, which for a sparse file overstates the blocks actually in use"
           Examples = [ "~/.local/share/containers/podman/machine" ] }
 
       { rule "Python Bytecode Caches" [ MacOS; Linux ] (HomeRelative "") DeveloperArtifacts with
