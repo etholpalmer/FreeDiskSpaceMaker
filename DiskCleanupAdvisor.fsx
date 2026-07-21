@@ -26,6 +26,8 @@
 #load "src/Report/Dto.fsx"
 #load "src/Report/Json.fsx"
 #load "src/Report/Console.fsx"
+#load "src/Report/Markdown.fsx"
+#load "src/Report/Html.fsx"
 #load "src/Cli.fsx"
 #load "src/Cleaner.fsx"
 
@@ -76,6 +78,18 @@ let private runScan (options: Cli.Options) (config: Configuration.Config) (log: 
               | Some path ->
                   match Report.Json.write path result with
                   | Ok () -> log |> Logging.info (sprintf "wrote JSON report to %s" path)
+                  | Error e -> yield e
+              | None -> ()
+              match options.MarkdownPath with
+              | Some path ->
+                  match Report.Markdown.write path result with
+                  | Ok () -> log |> Logging.info (sprintf "wrote Markdown report to %s" path)
+                  | Error e -> yield e
+              | None -> ()
+              match options.HtmlPath with
+              | Some path ->
+                  match Report.Html.write path result with
+                  | Ok () -> log |> Logging.info (sprintf "wrote HTML report to %s" path)
                   | Error e -> yield e
               | None -> () ]
 
