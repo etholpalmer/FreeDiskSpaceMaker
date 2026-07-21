@@ -89,3 +89,38 @@ let run () =
             assertEqual 1 files.Length "files inside a dot-directory are reachable"
         finally
             IO.Directory.Delete(root, true))
+
+    test "an unreadable directory surfaces PermissionDenied, never a silent empty" (fun () ->
+        // With EnumerationOptions.IgnoreInaccessible = true, .NET returns an empty
+        // result for a directory it cannot read. The walker would then record no
+        // error, unreadableDirectoryCount would stay zero, and the "grant Full Disk
+        // Access" hint would never fire — a partial scan presented as a complete one.
+        // This test fails if that flag is ever flipped back.
+        let root = IO.Path.Combine(IO.Path.GetTempPath(), "dcadenied")
+        let locked = IO.Path.Combine(root, "locked")
+        let unlock () =
+            try IO.File.SetUnixFileMode(locked,
+                    IO.UnixFileMode.UserRead ||| IO.UnixFileMode.UserWrite ||| IO.UnixFileMode.UserExecute)
+            with _ -> ()
+        if IO.Directory.Exists root then
+            unlock ()
+            IO.Directory.Delete(root, true)
+        IO.Directory.CreateDirectory locked |> ignore
+        IO.File.WriteAllText(IO.Path.Combine(locked, "inner.txt"), "x")
+        IO.File.WriteAllText(IO.Path.Combine(root, "visible.txt"), "y")
+        try
+            IO.File.SetUnixFileMode(locked, IO.UnixFileMode.None)
+            match FileSystem.real.EnumerateFiles locked with
+            | Ok entries ->
+                assertTrue false
+                    (sprintf "expected PermissionDenied, got Ok with %d entries — IgnoreInaccessible is true again" entries.Length)
+            | Error (PermissionDenied _) -> ()
+            | Error other -> assertTrue false (sprintf "expected PermissionDenied, got %A" other)
+            // A readable sibling must still enumerate: the flag change must not
+            // break partially-readable parents.
+            let parentFiles = assertOk (FileSystem.real.EnumerateFiles root) "parent still readable"
+            assertEqual 1 parentFiles.Length "parent yields its readable file despite a denied subdirectory"
+        finally
+            unlock ()
+            IO.Directory.Delete(root, true))
+

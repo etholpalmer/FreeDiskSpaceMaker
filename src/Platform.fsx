@@ -101,8 +101,22 @@ module FileSystem =
 
     /// Enumeration settings shared by the real implementation.
     ///
-    /// IgnoreInaccessible lets a partially-readable directory still yield its
-    /// readable entries instead of failing wholesale.
+    /// IgnoreInaccessible must be false. With it true, enumerating an
+    /// unreadable directory returns an empty result instead of throwing, so the
+    /// walker records no error, `unreadableDirectoryCount` stays zero, and the
+    /// "grant Full Disk Access" hint never fires — the tool presents a partial
+    /// scan as a complete one. Measured: a chmod-000 directory returned
+    /// `Ok, 0 entries` and its parent walk reported 0 errors.
+    ///
+    /// Setting it false costs nothing here, because the walker descends
+    /// manually with RecurseSubdirectories = false, so each call lists exactly
+    /// one directory. On Unix, listing a directory needs read+execute on that
+    /// directory alone, not on its children. Measured on a parent holding an
+    /// unreadable file and a chmod-000 subdirectory: GetFiles returned all 3
+    /// readable entries and GetDirectories all 2, identical to IgnoreInaccessible
+    /// = true. Only enumerating the denied directory itself throws — which is
+    /// exactly the case that must be surfaced. The partial-read protection this
+    /// flag offers applies to recursive enumeration, which this code never uses.
     ///
     /// AttributesToSkip must be None. The .NET default is `Hidden ||| System`,
     /// and on Unix every dotfile carries the Hidden attribute — so the default
@@ -112,7 +126,7 @@ module FileSystem =
     /// directory, and `~/.nuget/packages` (5.2 GB) reported zero findings.
     let private enumerationOptions =
         EnumerationOptions(
-            IgnoreInaccessible = true,
+            IgnoreInaccessible = false,
             RecurseSubdirectories = false,
             ReturnSpecialDirectories = false,
             AttributesToSkip = FileAttributes.None)

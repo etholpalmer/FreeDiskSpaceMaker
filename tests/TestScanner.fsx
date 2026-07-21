@@ -236,3 +236,25 @@ let run () =
             (withDuplicates.Findings |> List.forall (fun f -> f.Candidate.IsSome))
             "every finding still gets a candidate from its own Safe rule, independent of duplicate grouping"
         assertTrue (withDuplicates.Duplicates |> List.forall (fun g -> g.Wasted > 0L)) "wasted bytes are reported")
+
+    test "unreadable directories are counted once, not once per probe" (fun () ->
+        // The walker probes each directory twice — files, then subdirectories —
+        // so one unreadable directory produces two PermissionDenied errors.
+        // The Full Disk Access hint must report directories, not error records.
+        let denied = Platform.FileSystem.inMemory []
+        let result : ScanResult =
+            { GeneratedAtUtc = DateTime.UtcNow
+              Platform = Platform.current ()
+              ScanRoots = [ "/x" ]
+              Findings = []
+              Duplicates = []
+              Errors =
+                [ PermissionDenied "/x/locked"
+                  PermissionDenied "/x/locked"
+                  PermissionDenied "/x/other"
+                  PathNotFound "/x/gone" ]
+              Elapsed = TimeSpan.Zero
+              Counters = Diagnostics.snapshot (Diagnostics.create ()) }
+        ignore denied
+        assertEqual 2 (unreadableDirectoryCount result) "two distinct directories, not three errors")
+

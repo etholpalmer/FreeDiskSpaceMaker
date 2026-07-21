@@ -263,6 +263,11 @@ let byCategory (result: ScanResult) : (Category * Finding list) list =
 
 /// The count of directories that could not be read, for the Full Disk Access hint.
 let unreadableDirectoryCount (result: ScanResult) : int =
+    // Counted by distinct path. The walker probes each directory twice — once
+    // for its files and once for its subdirectories — so an unreadable
+    // directory yields two PermissionDenied errors. Counting raw errors would
+    // report double the directories the user actually needs to grant access to.
     result.Errors
-    |> List.filter (function PermissionDenied _ -> true | _ -> false)
+    |> List.choose (function PermissionDenied p -> Some (Utilities.Path.normalize p) | _ -> None)
+    |> List.distinct
     |> List.length
