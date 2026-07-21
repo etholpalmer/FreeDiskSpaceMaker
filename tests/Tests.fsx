@@ -10,15 +10,18 @@
 #load "../src/Logging.fsx"
 #load "../src/Diagnostics.fsx"
 #load "../src/Platform.fsx"
+#load "../src/Configuration.fsx"
 #load "TestFramework.fsx"
 #load "TestTypes.fsx"
 #load "TestUtilities.fsx"
 #load "TestDiagnostics.fsx"
 #load "TestPlatform.fsx"
+#load "TestConfiguration.fsx"
 
 TestTypes.run ()
 TestUtilities.run ()
 TestDiagnostics.run ()
 TestPlatform.run ()
+TestConfiguration.run ()
 
 exit (TestFramework.report ())
