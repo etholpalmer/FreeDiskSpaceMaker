@@ -6,9 +6,12 @@
     Run with:  dotnet fsi tests/Tests.fsx
 *)
 #load "../src/Types.fsx"
+#load "../src/Utilities.fsx"
 #load "TestFramework.fsx"
 #load "TestTypes.fsx"
+#load "TestUtilities.fsx"
 
 TestTypes.run ()
+TestUtilities.run ()
 
 exit (TestFramework.report ())
