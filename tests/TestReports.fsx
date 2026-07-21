@@ -22,6 +22,7 @@ let private sample () : Scanner.ScanResult =
           { Meta = meta "/cache/<script>.tmp" 2048L; RuleName = "Cache"; Category = Caches
             Risk = Review; Recoverability = Unrecoverable; Strategy = MatchingFiles
             Reason = "needs review"; Candidate = None } ]
+      Duplicates = []
       Errors = []
       Elapsed = TimeSpan.FromSeconds 2.0
       Counters = Diagnostics.snapshot (Diagnostics.create ()) }

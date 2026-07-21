@@ -20,9 +20,9 @@
 #load "src/RiskEngine.fsx"
 #load "src/FileClassifier.fsx"
 #load "src/DirectoryWalker.fsx"
-#load "src/Scanner.fsx"
 #load "src/Hashing.fsx"
 #load "src/Duplicates.fsx"
+#load "src/Scanner.fsx"
 #load "src/Report/Dto.fsx"
 #load "src/Report/Json.fsx"
 #load "src/Snapshots.fsx"
@@ -45,8 +45,7 @@ let private fail (errors: string list) : int =
 let private mergeOptions (options: Cli.Options) (config: Configuration.Config) : Configuration.Config =
     { config with
         AgeThresholdDays = defaultArg options.AgeDays config.AgeThresholdDays
-        MinSizeBytes = defaultArg options.MinSizeBytes config.MinSizeBytes
-        ThreadCount = defaultArg options.Threads config.ThreadCount
+        FindingsMinSizeBytes = defaultArg options.MinSizeBytes config.FindingsMinSizeBytes
         HashAlgorithm = defaultArg options.HashAlgorithm config.HashAlgorithm }
 
 /// Runs a scan and emits every requested report.
@@ -64,7 +63,7 @@ let private runScan (options: Cli.Options) (config: Configuration.Config) (log: 
         0
     else
 
-    match Scanner.scan fs config options.Force rules with
+    match Scanner.scan fs config options.Force options.Duplicates rules with
     | Error errors -> fail errors
     | Ok result ->
         log |> Logging.info (sprintf "scan complete: %d findings" result.Findings.Length)
@@ -77,7 +76,7 @@ let private runScan (options: Cli.Options) (config: Configuration.Config) (log: 
                 []
 
         // Console output always.
-        printf "%s" (Report.Console.render snapshots result)
+        printf "%s" (Report.Console.render snapshots result options.LargeFiles)
 
         // File reports on request. A write failure is reported but does not
         // discard the scan that already succeeded.
@@ -129,7 +128,7 @@ let private main () : int =
             let config = mergeOptions options config
             let fs = Platform.FileSystem.real
             let rules = Rules.resolveAll fs (Platform.current ())
-            match Scanner.scan fs config options.Force rules with
+            match Scanner.scan fs config options.Force options.Duplicates rules with
             | Error errors -> fail errors
             | Ok result ->
                 let snapshots =
@@ -138,7 +137,7 @@ let private main () : int =
                     | Error message ->
                         log |> Logging.warn message
                         []
-                printf "%s" (Report.Console.render snapshots result)
+                printf "%s" (Report.Console.render snapshots result options.LargeFiles)
                 let candidates = result.Findings |> List.choose (fun f -> f.Candidate)
                 if List.isEmpty candidates then
                     printfn "Nothing is eligible for automatic removal."

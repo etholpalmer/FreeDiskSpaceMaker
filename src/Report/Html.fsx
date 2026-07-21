@@ -102,6 +102,31 @@ let render (result: Scanner.ScanResult) : string =
         if n = 0 then ""
         else sprintf "<p class=\"warn\">%d directories were unreadable. Grant Full Disk Access to your terminal to include them.</p>" n
 
+    // Duplicate files (--duplicates). Review only — never a deletion
+    // candidate, never summed with reclaimable or pending-review bytes.
+    let duplicatesSection =
+        if List.isEmpty result.Duplicates then ""
+        else
+            let rows =
+                result.Duplicates
+                |> List.truncate 25
+                |> List.map (fun g ->
+                    sprintf "<tr><td class=\"num\">%s</td><td class=\"num\">%s</td><td class=\"num\">%d</td><td class=\"path\">%s</td></tr>"
+                        (Utilities.Format.bytes g.Wasted)
+                        (Utilities.Format.bytes g.SizeBytes)
+                        g.Paths.Length
+                        (escape g.Keeper))
+                |> String.concat "\n"
+            sprintf """<details open><summary>Duplicate files</summary>
+<p class="sub">%d groups, %s wasted across redundant copies. Review only — a duplicate never becomes a deletion candidate.</p>
+<table>
+<thead><tr><th>Wasted</th><th>Size</th><th>Copies</th><th>Keeper</th></tr></thead>
+<tbody>
+%s
+</tbody></table>
+</details>"""
+                result.Duplicates.Length (Utilities.Format.bytes (Scanner.wastedBytes result)) rows
+
     // Assembled as one string. No external resource is referenced anywhere.
     sprintf """<!DOCTYPE html>
 <html lang="en">
@@ -180,6 +205,8 @@ summary { cursor:pointer; font-weight:600; padding:.4rem 0; }
 </tbody></table>
 </details>
 
+%s
+
 <p class="sub">Removal moves items to the Trash. Space is reclaimed when you empty it.</p>
 </main>
 <script>
@@ -224,6 +251,7 @@ document.querySelectorAll('#items th').forEach((th, index) => {
         (treemap (largest |> List.truncate 12 |> List.map (fun f -> IO.Path.GetFileName f.Meta.Path, f.Meta.SizeBytes)))
         categoryRows
         rows
+        duplicatesSection
 
 /// Writes the HTML report to disk.
 let write (path: string) (result: Scanner.ScanResult) : Result<unit, string> =

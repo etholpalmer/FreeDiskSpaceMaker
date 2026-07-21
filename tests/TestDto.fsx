@@ -32,8 +32,10 @@ let run () =
           TotalBytes = 4096L
           ReclaimableBytes = 4096L
           PendingReviewBytes = 0L
+          DuplicateWastedBytes = 0L
           Categories = [ { Category = "Logs"; ItemCount = 1; TotalBytes = 4096L; ReclaimableBytes = 4096L } ]
           Findings = [ sampleFinding ]
+          Duplicates = []
           Errors = []
           UnreadableDirectoryCount = 0
           ElapsedSeconds = 1.25 }
@@ -56,6 +58,16 @@ let run () =
         let empty = { sampleResult with Findings = []; Categories = []; TotalItems = 0 }
         let json = JsonSerializer.Serialize(empty, serializerOptions)
         assertContains "\"findings\":[]" (json.Replace(" ", "")) "empty array, not null")
+
+    test "a duplicate group serializes without a risk field, without throwing" (fun () ->
+        // DuplicateGroupDto has no DU fields either — this is the same guard
+        // as the finding test, applied to the duplicates DTO.
+        let group : DuplicateGroupDto =
+            { SizeBytes = 4096L; Paths = [ "/a"; "/b" ]; Keeper = "/a"; Wasted = 4096L }
+        let withDuplicate = { sampleResult with Duplicates = [ group ]; DuplicateWastedBytes = 4096L }
+        let json = JsonSerializer.Serialize(withDuplicate, serializerOptions)
+        assertContains "\"duplicates\"" json "duplicates present"
+        assertContains "\"duplicateWastedBytes\":4096" (json.Replace(" ", "").Replace("\n", "")) "wasted bytes present")
 
     test "output is indented for human readability" (fun () ->
         let json = JsonSerializer.Serialize(sampleResult, serializerOptions)

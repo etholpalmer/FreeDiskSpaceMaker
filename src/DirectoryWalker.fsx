@@ -34,7 +34,11 @@ open Utilities
 type WalkOptions =
     { /// Maximum directory depth below the root. Bounds pathological trees.
       MaxDepth: int
-      /// Reserved for the parallel implementation added in Task 17.
+      /// Unused. Parallel traversal was measured and declined (see the file
+      /// header): this workload is kernel-I/O-bound, exactly where thread
+      /// parallelism helps least, so the walk stays sequential regardless of
+      /// this value. Kept on the record only because removing it ripples
+      /// into Configuration.Config.ThreadCount and the --config schema.
       ThreadCount: int
       /// Absolute paths whose subtrees are skipped entirely.
       IgnorePaths: string list

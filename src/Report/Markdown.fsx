@@ -30,6 +30,23 @@ let render (result: Scanner.ScanResult) : string =
     line ""
     line "Removal moves items to the Trash. Space is reclaimed when you empty it."
     line ""
+
+    if not (List.isEmpty result.Duplicates) then
+        line "## Duplicate files"
+        line ""
+        line (sprintf "%d groups, %s wasted across redundant copies. Review only — a duplicate never becomes a deletion candidate."
+                  result.Duplicates.Length (Utilities.Format.bytes (Scanner.wastedBytes result)))
+        line ""
+        line "| Wasted | Size | Copies | Keeper |"
+        line "|---:|---:|---:|---|"
+        for g in result.Duplicates |> List.truncate 25 do
+            line (sprintf "| %s | %s | %d | `%s` |"
+                      (Utilities.Format.bytes g.Wasted)
+                      (Utilities.Format.bytes g.SizeBytes)
+                      g.Paths.Length
+                      (cell g.Keeper))
+        line ""
+
     line "## By category"
     line ""
     line "| Category | Total | Reclaimable | Items |"

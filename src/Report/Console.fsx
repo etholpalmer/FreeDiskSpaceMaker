@@ -37,12 +37,20 @@ let private riskBadge (level: RiskLevel) =
 let private rule () = String.replicate 72 "─"
 
 /// Renders the complete console report.
-let render (snapshots: Snapshots.LocalSnapshot list) (result: Scanner.ScanResult) : string =
+///
+/// `showLargeFiles` corresponds to --large-files and adds a dedicated top-50
+/// section beyond the always-present top-10 "Largest items" summary.
+let render
+    (snapshots: Snapshots.LocalSnapshot list)
+    (result: Scanner.ScanResult)
+    (showLargeFiles: bool)
+    : string =
     let sb = StringBuilder()
     let append (text: string) = sb.AppendLine text |> ignore
 
     let reclaimable = Scanner.reclaimableBytes result
     let pending = Scanner.pendingReviewBytes result
+    let wasted = Scanner.wastedBytes result
 
     append ""
     append (colorize bold "DiskCleanupAdvisor")
@@ -60,6 +68,10 @@ let render (snapshots: Snapshots.LocalSnapshot list) (result: Scanner.ScanResult
     append (sprintf "  Pending review   %s   %s"
                 (colorize "\027[33m" (Format.bytes pending))
                 (colorize dim "requires your judgment"))
+    if not (List.isEmpty result.Duplicates) then
+        append (sprintf "  Duplicate waste  %s   %s"
+                    (colorize "\027[33m" (Format.bytes wasted))
+                    (colorize dim "review only — never reclaimable automatically"))
     append ""
 
     // Per-category breakdown, largest first.
@@ -89,6 +101,33 @@ let render (snapshots: Snapshots.LocalSnapshot list) (result: Scanner.ScanResult
         append (colorize bold "Largest items")
         for f in largest do
             append (sprintf "  %s %10s  %s" (riskBadge f.Risk) (Format.bytes f.Meta.SizeBytes) f.Meta.Path)
+        append ""
+
+    // A fuller top-50 section on request, beyond the always-present top-10
+    // above. Kept as a distinct block rather than folded into "Largest
+    // items" so --large-files has a visibly different, more complete report.
+    if showLargeFiles then
+        let top50 =
+            result.Findings
+            |> List.sortByDescending (fun f -> f.Meta.SizeBytes)
+            |> List.truncate 50
+        append (colorize bold "Large files (top 50)")
+        for f in top50 do
+            append (sprintf "  %s %10s  %s" (riskBadge f.Risk) (Format.bytes f.Meta.SizeBytes) f.Meta.Path)
+        append ""
+
+    // Duplicate files (--duplicates). Review only: identical bytes do not
+    // make a copy disposable, so nothing here ever becomes a deletion
+    // candidate or contributes to reclaimableBytes.
+    if not (List.isEmpty result.Duplicates) then
+        append (colorize bold "Duplicate files")
+        append (sprintf "  %d groups, %s wasted across redundant copies (review only)"
+                    result.Duplicates.Length (Format.bytes wasted))
+        for g in result.Duplicates |> List.truncate 10 do
+            append (sprintf "  %s wasted  %d copies  keeper: %s"
+                        (Format.bytes g.Wasted) g.Paths.Length g.Keeper)
+            for p in g.Paths |> List.filter (fun p -> p <> g.Keeper) |> List.truncate 4 do
+                append (sprintf "      %s" p)
         append ""
 
     // Diagnostics.

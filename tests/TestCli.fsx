@@ -38,10 +38,9 @@ let run () =
         assertEqual None options.MarkdownPath "markdown not requested")
 
     test "numeric options are parsed" (fun () ->
-        let options = assertOk (parse [ "--age"; "60"; "--min-size"; "2048"; "--threads"; "4" ]) "numeric options"
+        let options = assertOk (parse [ "--age"; "60"; "--min-size"; "2048" ]) "numeric options"
         assertEqual (Some 60) options.AgeDays "age"
-        assertEqual (Some 2048L) options.MinSizeBytes "min size"
-        assertEqual (Some 4) options.Threads "threads")
+        assertEqual (Some 2048L) options.MinSizeBytes "min size")
 
     test "boolean flags are captured" (fun () ->
         let options = assertOk (parse [ "--duplicates"; "--large-files"; "--verbose"; "--force" ]) "boolean flags"
@@ -60,15 +59,25 @@ let run () =
         assertContains "value" (List.head errors) "explains what is missing")
 
     test "a non-numeric value for a numeric flag is an error" (fun () ->
-        let errors = assertError (parse [ "--threads"; "many" ]) "bad number"
+        let errors = assertError (parse [ "--age"; "many" ]) "bad number"
         assertContains "many" (List.head errors) "names the offending value")
 
     test "every error is reported at once" (fun () ->
-        let errors = assertError (parse [ "--nonsense"; "--threads"; "many" ]) "two problems"
+        let errors = assertError (parse [ "--nonsense"; "--age"; "many" ]) "two problems"
         assertEqual 2 errors.Length "both errors reported")
+
+    test "--threads is not a recognized flag" (fun () ->
+        // Parallel traversal was measured and declined (90s wall, 38.6s
+        // user, 36.6s sys — kernel-I/O-bound), so --threads cannot do
+        // anything and must not be accepted.
+        let errors = assertError (parse [ "--threads"; "4" ]) "removed flag"
+        assertContains "--threads" (List.head errors) "names the flag")
 
     test "help text documents every supported flag" (fun () ->
         for flag in [ "--scan"; "--delete"; "--force"; "--dry-run"; "--json"; "--markdown"
                       "--html"; "--duplicates"; "--large-files"; "--age"; "--min-size"
-                      "--threads"; "--hash-algorithm"; "--config"; "--allow-root"; "--verbose"; "--help" ] do
+                      "--hash-algorithm"; "--config"; "--allow-root"; "--verbose"; "--help" ] do
             assertContains flag helpText (sprintf "%s is documented" flag))
+
+    test "help text does not document the removed --threads flag" (fun () ->
+        assertFalse (helpText.Contains "--threads") "threads is gone")

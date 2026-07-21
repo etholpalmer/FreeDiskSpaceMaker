@@ -32,7 +32,6 @@ type Options =
       LargeFiles: bool
       AgeDays: int option
       MinSizeBytes: int64 option
-      Threads: int option
       HashAlgorithm: string option
       /// Widens the risk gate to include ProbablySafe. Never bypasses the veto.
       Force: bool
@@ -50,7 +49,6 @@ let private empty: Options =
       LargeFiles = false
       AgeDays = None
       MinSizeBytes = None
-      Threads = None
       HashAlgorithm = None
       Force = false
       AllowRoot = false
@@ -75,12 +73,16 @@ REPORTS
     --html <path>           Write a self-contained HTML report.
 
 SCAN OPTIONS
-    --duplicates            Detect duplicate files.
-    --large-files           Report the largest files.
-    --age <days>            Only consider items older than this.
-    --min-size <bytes>      Size floor for hashing and large-file reporting.
-    --threads <n>           Traversal parallelism.
-    --hash-algorithm <alg>  sha256 (default) or md5.
+    --duplicates            Detect duplicate files and report them in a
+                            separate section. Duplicates are Review only and
+                            never become deletion candidates.
+    --large-files           Report a dedicated top-50 largest-files section.
+    --age <days>            Only report items at least this many days old,
+                            on top of whatever age floor each rule already
+                            applies.
+    --min-size <bytes>      Only report items at least this large, on top of
+                            whatever size floor each rule already applies.
+    --hash-algorithm <alg>  sha256 (default) or md5. Used for --duplicates.
     --config <path>         Configuration file.
 
 SAFETY
@@ -160,9 +162,6 @@ let parse (args: string list) : Result<Options, string list> =
             | "--min-size" ->
                 let value, next = readValue flag rest
                 loop { options with MinSizeBytes = value |> Option.bind (parseInt64 flag) } next
-            | "--threads" ->
-                let value, next = readValue flag rest
-                loop { options with Threads = value |> Option.bind (parseInt flag) } next
             | unknown ->
                 errors.Add(sprintf "unknown option '%s' (try --help)" unknown)
                 loop options rest

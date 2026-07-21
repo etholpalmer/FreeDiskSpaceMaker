@@ -25,6 +25,13 @@ let private findingToDto (now: DateTime) (f: Scanner.Finding) : Dto.FindingDto =
       SafeToDelete = f.Candidate.IsSome
       Reason = f.Reason }
 
+/// Projects one duplicate group into its serialization-safe form.
+let private duplicateToDto (g: Duplicates.DuplicateGroup) : Dto.DuplicateGroupDto =
+    { SizeBytes = g.SizeBytes
+      Paths = g.Paths
+      Keeper = g.Keeper
+      Wasted = g.Wasted }
+
 /// Projects a whole scan result into its serialization-safe form.
 let toDto (result: Scanner.ScanResult) : Dto.ScanResultDto =
     let now = result.GeneratedAtUtc
@@ -48,8 +55,10 @@ let toDto (result: Scanner.ScanResult) : Dto.ScanResultDto =
       TotalBytes = result.Findings |> List.sumBy (fun f -> f.Meta.SizeBytes)
       ReclaimableBytes = Scanner.reclaimableBytes result
       PendingReviewBytes = Scanner.pendingReviewBytes result
+      DuplicateWastedBytes = Scanner.wastedBytes result
       Categories = categories
       Findings = result.Findings |> List.map (findingToDto now)
+      Duplicates = result.Duplicates |> List.map duplicateToDto
       Errors = result.Errors |> List.map FsError.toText
       UnreadableDirectoryCount = Scanner.unreadableDirectoryCount result
       ElapsedSeconds = result.Elapsed.TotalSeconds }

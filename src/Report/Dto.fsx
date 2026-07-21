@@ -28,6 +28,15 @@ type FindingDto =
       SafeToDelete: bool
       Reason: string }
 
+/// One group of byte-identical files (--duplicates). Review only: a
+/// duplicate group never corresponds to a deletion candidate, so this DTO
+/// deliberately has no risk or safe-to-delete field.
+type DuplicateGroupDto =
+    { SizeBytes: int64
+      Paths: string list
+      Keeper: string
+      Wasted: int64 }
+
 /// Aggregate figures for one category.
 type CategorySummaryDto =
     { Category: string
@@ -49,8 +58,13 @@ type ScanResultDto =
       /// ReclaimableBytes: conflating them would let a user believe space had
       /// been freed when it had only been listed.
       PendingReviewBytes: int64
+      /// Bytes consumed by redundant duplicate copies. Deliberately its own
+      /// figure — never summed with ReclaimableBytes or PendingReviewBytes,
+      /// since duplicate groups never contribute a deletion candidate.
+      DuplicateWastedBytes: int64
       Categories: CategorySummaryDto list
       Findings: FindingDto list
+      Duplicates: DuplicateGroupDto list
       Errors: string list
       UnreadableDirectoryCount: int
       ElapsedSeconds: float }

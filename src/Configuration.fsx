@@ -22,9 +22,20 @@ type Config =
       IgnorePaths: string list
       /// Lowercase extensions (with leading dot) excluded from results.
       IgnoreExtensions: string list
-      /// Files below this size are ignored for hashing and large-file reporting.
+      /// Files below this size are ignored for hashing (--duplicates) and are
+      /// the floor `Duplicates.find` is called with. This is deliberately
+      /// separate from `FindingsMinSizeBytes` below: 1 MB is a sensible
+      /// default for "don't bother hashing tiny files" but would be a
+      /// destructive default for "don't report tiny files" — it would
+      /// silently drop most findings from every report.
       MinSizeBytes: int64
-      /// Items younger than this are not considered stale.
+      /// Additional size floor applied to every finding (--min-size).
+      /// Zero by default, so a plain scan is unaffected: only an explicit
+      /// --min-size (or config value) narrows the report.
+      FindingsMinSizeBytes: int64
+      /// Additional age floor applied to every finding, on top of each
+      /// rule's own MinAge (--age). Zero means no additional floor, so a
+      /// plain scan is unaffected.
       AgeThresholdDays: int
       /// Traversal parallelism.
       ThreadCount: int
@@ -39,7 +50,8 @@ let defaults: Config =
     { IgnorePaths = []
       IgnoreExtensions = []
       MinSizeBytes = 1_048_576L
-      AgeThresholdDays = 30
+      FindingsMinSizeBytes = 0L
+      AgeThresholdDays = 0
       ThreadCount = min Environment.ProcessorCount 8
       HashAlgorithm = "sha256"
       RiskOverrides = Map.empty }
@@ -123,6 +135,8 @@ let private validate (config: Config) : Result<Config, string list> =
     let errors =
         [ if config.MinSizeBytes < 0L then
             yield sprintf "minSizeBytes must be zero or greater (got %d)" config.MinSizeBytes
+          if config.FindingsMinSizeBytes < 0L then
+            yield sprintf "findingsMinSizeBytes must be zero or greater (got %d)" config.FindingsMinSizeBytes
           if config.AgeThresholdDays < 0 then
             yield sprintf "ageThresholdDays must be zero or greater (got %d)" config.AgeThresholdDays
           if config.ThreadCount < 1 then
@@ -152,6 +166,7 @@ let parse (json: string) : Result<Config, string list> =
             let ignorePaths = readStringArray root "ignorePaths"
             let ignoreExtensions = readStringArray root "ignoreExtensions"
             let minSize = readInt64 root "minSizeBytes"
+            let findingsMinSize = readInt64 root "findingsMinSizeBytes"
             let ageThreshold = readInt root "ageThresholdDays"
             let threadCount = readInt root "threadCount"
             let hashAlgorithm = readString root "hashAlgorithm"
@@ -161,6 +176,7 @@ let parse (json: string) : Result<Config, string list> =
                 [ match ignorePaths with Error e -> yield e | _ -> ()
                   match ignoreExtensions with Error e -> yield e | _ -> ()
                   match minSize with Error e -> yield e | _ -> ()
+                  match findingsMinSize with Error e -> yield e | _ -> ()
                   match ageThreshold with Error e -> yield e | _ -> ()
                   match threadCount with Error e -> yield e | _ -> ()
                   match hashAlgorithm with Error e -> yield e | _ -> ()
@@ -183,6 +199,7 @@ let parse (json: string) : Result<Config, string list> =
                             let lower = e.Trim().ToLowerInvariant()
                             if lower.StartsWith "." then lower else "." + lower)
                       MinSizeBytes = pick minSize defaults.MinSizeBytes
+                      FindingsMinSizeBytes = pick findingsMinSize defaults.FindingsMinSizeBytes
                       AgeThresholdDays = pick ageThreshold defaults.AgeThresholdDays
                       ThreadCount = pick threadCount defaults.ThreadCount
                       HashAlgorithm = (pick hashAlgorithm defaults.HashAlgorithm).Trim().ToLowerInvariant()

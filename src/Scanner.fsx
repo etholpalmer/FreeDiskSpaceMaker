@@ -36,13 +36,27 @@ type ScanResult =
       Platform: Types.Platform
       ScanRoots: string list
       Findings: Finding list
+      /// Groups of byte-identical files (--duplicates). Empty when the flag
+      /// is off. Deliberately separate from Findings: identical bytes do not
+      /// make a copy disposable, so a duplicate group never contributes a
+      /// deletion candidate and never affects reclaimableBytes.
+      Duplicates: Duplicates.DuplicateGroup list
       Errors: FsError list
       Elapsed: TimeSpan
       Counters: Diagnostics.Snapshot }
 
 /// True when a file satisfies a rule's include globs, exclude globs, age
-/// floor, and size floor.
-let private satisfies (now: DateTime) (root: string) (rule: Rules.Rule) (meta: FileMeta) : bool =
+/// floor, and size floor, plus the global age and size floors from
+/// configuration (--age and --min-size), which apply on top of whatever the
+/// rule itself already requires.
+let private satisfies
+    (now: DateTime)
+    (globalAgeFloorDays: int)
+    (globalMinSizeBytes: int64)
+    (root: string)
+    (rule: Rules.Rule)
+    (meta: FileMeta)
+    : bool =
     // Globs are matched against the path relative to the rule root, so a rule
     // does not have to know where it was resolved to.
     let relative =
@@ -68,18 +82,28 @@ let private satisfies (now: DateTime) (root: string) (rule: Rules.Rule) (meta: F
         | None -> true
         | Some minimum -> meta.SizeBytes >= minimum
 
-    includeOk && excludeOk && ageOk && sizeOk
+    // Global floors from --age and --min-size. Zero means "no additional
+    // floor" for both, so a plain scan with neither flag is unaffected.
+    let globalAgeOk =
+        globalAgeFloorDays <= 0 || FileMeta.age now meta >= TimeSpan.FromDays(float globalAgeFloorDays)
+
+    let globalSizeOk =
+        globalMinSizeBytes <= 0L || meta.SizeBytes >= globalMinSizeBytes
+
+    includeOk && excludeOk && ageOk && sizeOk && globalAgeOk && globalSizeOk
 
 /// Finds the first rule in precedence order that claims this file.
 let private firstMatch
     (now: DateTime)
+    (globalAgeFloorDays: int)
+    (globalMinSizeBytes: int64)
     (rules: Rules.ResolvedRule list)
     (meta: FileMeta)
     : Rules.ResolvedRule option =
     rules
     |> List.tryFind (fun resolved ->
         Utilities.Path.isDescendantOf resolved.Root meta.Path
-        && satisfies now resolved.Root resolved.Rule meta)
+        && satisfies now globalAgeFloorDays globalMinSizeBytes resolved.Root resolved.Rule meta)
 
 /// Runs a scan over every resolved rule root.
 ///
@@ -90,12 +114,18 @@ let private firstMatch
 /// this filtering.
 ///
 /// `allowProbablySafe` corresponds to --force and widens only the risk gate.
+/// `computeDuplicates` corresponds to --duplicates: when true, the files the
+/// walk already collected are fed through the duplicate funnel and reported
+/// under `ScanResult.Duplicates`. This never creates deletion candidates and
+/// never touches `Findings` or `reclaimableBytes` — duplicates are Review
+/// only, reported in a separate section.
 /// Returns Error when configuration overrides are invalid, because continuing
 /// would apply a risk policy the user did not actually get.
 let scan
     (fs: Platform.FileSystemOps)
     (config: Configuration.Config)
     (allowProbablySafe: bool)
+    (computeDuplicates: bool)
     (rules: Rules.ResolvedRule list)
     : Result<ScanResult, string list> =
 
@@ -155,7 +185,7 @@ let scan
         allFiles
         |> List.filter (fun meta -> not (ignoredExtension meta.Path))
         |> List.choose (fun meta ->
-            match firstMatch now effectiveRules meta with
+            match firstMatch now config.AgeThresholdDays config.FindingsMinSizeBytes effectiveRules meta with
             | None -> None
             | Some resolved ->
                 let rule = resolved.Rule
@@ -181,11 +211,25 @@ let scan
         // rules are precedence-sorted) and preserve relative order.
         |> List.distinctBy (fun f -> Utilities.Path.normalize f.Meta.Path)
 
+    // Duplicate detection reuses the files the walk already collected — it
+    // never re-walks the tree. It is intentionally independent of rule
+    // matching: a duplicate need not match any rule to be worth reporting.
+    let duplicates =
+        if not computeDuplicates then []
+        else
+            match Hashing.parse config.HashAlgorithm with
+            | Ok algorithm -> Duplicates.find fs algorithm config.MinSizeBytes allFiles
+            | Error _ ->
+                // Configuration validation already restricts HashAlgorithm to
+                // "sha256" or "md5", so this is unreachable in practice.
+                Duplicates.find fs Hashing.Sha256 config.MinSizeBytes allFiles
+
     Ok
         { GeneratedAtUtc = now
           Platform = Platform.current ()
           ScanRoots = roots
           Findings = findings
+          Duplicates = duplicates
           Errors = allErrors
           Elapsed = counters.Clock.Elapsed
           Counters = Diagnostics.snapshot counters }
@@ -203,6 +247,13 @@ let pendingReviewBytes (result: ScanResult) : int64 =
     result.Findings
     |> List.filter (fun f -> f.Candidate.IsNone)
     |> List.sumBy (fun f -> f.Meta.SizeBytes)
+
+/// Total bytes consumed by redundant duplicate copies (every copy in a group
+/// except its keeper). Reported as its own figure — never summed with
+/// `reclaimableBytes` or `pendingReviewBytes`, since a duplicate group never
+/// contributes a deletion candidate.
+let wastedBytes (result: ScanResult) : int64 =
+    result.Duplicates |> List.sumBy (fun g -> g.Wasted)
 
 /// Groups findings by category, largest total first, dropping empty categories.
 let byCategory (result: ScanResult) : (Category * Finding list) list =
