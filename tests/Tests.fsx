@@ -17,6 +17,9 @@
 #load "../src/DirectoryWalker.fsx"
 #load "../src/Scanner.fsx"
 #load "../src/Report/Dto.fsx"
+#load "../src/Report/Json.fsx"
+#load "../src/Report/Console.fsx"
+#load "../src/Cli.fsx"
 #load "TestFramework.fsx"
 #load "TestTypes.fsx"
 #load "TestUtilities.fsx"
@@ -29,6 +32,7 @@
 #load "TestDirectoryWalker.fsx"
 #load "TestScanner.fsx"
 #load "TestDto.fsx"
+#load "TestCli.fsx"
 
 TestTypes.run ()
 TestUtilities.run ()
@@ -41,5 +45,6 @@ TestFileClassifier.run ()
 TestDirectoryWalker.run ()
 TestScanner.run ()
 TestDto.run ()
+TestCli.run ()
 
 exit (TestFramework.report ())

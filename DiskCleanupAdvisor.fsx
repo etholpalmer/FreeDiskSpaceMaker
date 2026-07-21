@@ -1,0 +1,113 @@
+(**
+    DiskCleanupAdvisor — entry point.
+
+    Finds disposable files, explains why each is disposable, and — only when
+    explicitly asked — moves them to the Trash. Never unlinks.
+
+    Usage:  dotnet fsi DiskCleanupAdvisor.fsx -- [options]
+            dotnet fsi DiskCleanupAdvisor.fsx -- --help
+
+    This file is composition only. All behavior lives in src/.
+*)
+
+#load "src/Types.fsx"
+#load "src/Utilities.fsx"
+#load "src/Logging.fsx"
+#load "src/Diagnostics.fsx"
+#load "src/Platform.fsx"
+#load "src/Configuration.fsx"
+#load "src/Rules.fsx"
+#load "src/RiskEngine.fsx"
+#load "src/FileClassifier.fsx"
+#load "src/DirectoryWalker.fsx"
+#load "src/Scanner.fsx"
+#load "src/Report/Dto.fsx"
+#load "src/Report/Json.fsx"
+#load "src/Report/Console.fsx"
+#load "src/Cli.fsx"
+
+open System
+
+/// Prints a list of errors to stderr and returns a failure exit code.
+let private fail (errors: string list) : int =
+    eprintfn "Error:"
+    for e in errors do eprintfn "  %s" e
+    1
+
+/// Applies command-line overrides on top of the loaded configuration.
+/// The command line wins over the file, which wins over the defaults.
+let private mergeOptions (options: Cli.Options) (config: Configuration.Config) : Configuration.Config =
+    { config with
+        AgeThresholdDays = defaultArg options.AgeDays config.AgeThresholdDays
+        MinSizeBytes = defaultArg options.MinSizeBytes config.MinSizeBytes
+        ThreadCount = defaultArg options.Threads config.ThreadCount
+        HashAlgorithm = defaultArg options.HashAlgorithm config.HashAlgorithm }
+
+/// Runs a scan and emits every requested report.
+let private runScan (options: Cli.Options) (config: Configuration.Config) (log: Logging.Logger) : int =
+    let fs = Platform.FileSystem.real
+    let platform = Platform.current ()
+
+    log |> Logging.info (sprintf "starting scan on %A" platform)
+
+    let rules = Rules.resolveAll fs platform
+    log |> Logging.info (sprintf "%d rules resolved on this machine" rules.Length)
+
+    if List.isEmpty rules then
+        eprintfn "No rules resolved on this machine. Nothing to scan."
+        0
+    else
+
+    match Scanner.scan fs config options.Force rules with
+    | Error errors -> fail errors
+    | Ok result ->
+        log |> Logging.info (sprintf "scan complete: %d findings" result.Findings.Length)
+
+        // Console output always.
+        printf "%s" (Report.Console.render result)
+
+        // File reports on request. A write failure is reported but does not
+        // discard the scan that already succeeded.
+        let writeFailures =
+            [ match options.JsonPath with
+              | Some path ->
+                  match Report.Json.write path result with
+                  | Ok () -> log |> Logging.info (sprintf "wrote JSON report to %s" path)
+                  | Error e -> yield e
+              | None -> () ]
+
+        if List.isEmpty writeFailures then 0 else fail writeFailures
+
+/// Entry point. `fsi.CommandLineArgs` includes the script name at index 0.
+let private main () : int =
+    let args = fsi.CommandLineArgs |> Array.toList |> List.skip 1
+
+    match Cli.parse args with
+    | Error errors ->
+        eprintfn "%s" Cli.helpText
+        eprintfn ""
+        fail errors
+    | Ok options ->
+
+    match options.Mode with
+    | Cli.Help ->
+        printfn "%s" Cli.helpText
+        0
+    | Cli.Delete ->
+        // Cleaner does not exist yet (Task 15). Until it does, the tool is
+        // structurally incapable of modifying anything, so --delete is
+        // refused explicitly rather than silently ignored.
+        eprintfn "--delete is not yet implemented. Run without it to scan."
+        1
+    | Cli.Scan ->
+        let log =
+            Logging.create (if options.Verbose then Logging.Debug else Logging.Info)
+
+        if Platform.isElevated () && not options.AllowRoot then
+            fail [ "refusing to run with elevated privileges; pass --allow-root to override" ]
+        else
+            match Configuration.load Platform.FileSystem.real options.ConfigPath with
+            | Error errors -> fail errors
+            | Ok config -> runScan options (mergeOptions options config) log
+
+exit (main ())
