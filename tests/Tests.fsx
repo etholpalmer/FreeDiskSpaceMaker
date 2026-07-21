@@ -13,6 +13,7 @@
 #load "../src/Configuration.fsx"
 #load "../src/Rules.fsx"
 #load "../src/RiskEngine.fsx"
+#load "../src/FileClassifier.fsx"
 #load "../src/Report/Dto.fsx"
 #load "TestFramework.fsx"
 #load "TestTypes.fsx"
@@ -22,6 +23,7 @@
 #load "TestConfiguration.fsx"
 #load "TestRules.fsx"
 #load "TestRiskEngine.fsx"
+#load "TestFileClassifier.fsx"
 #load "TestDto.fsx"
 
 TestTypes.run ()
@@ -31,6 +33,7 @@ TestPlatform.run ()
 TestConfiguration.run ()
 TestRules.run ()
 TestRiskEngine.run ()
+TestFileClassifier.run ()
 TestDto.run ()
 
 exit (TestFramework.report ())
