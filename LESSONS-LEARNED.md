@@ -267,37 +267,6 @@ The first three were recoverable with better unit fixtures. The last three requi
 
 ## Solution Gaps
 
-### 2026-07-21 — Sparse files are reported at apparent size, overstating them several-fold
-
-**Current State:** All sizes come from `FileInfo.Length`, which reports a file's *logical extent*. For a sparse file — one with holes that consume no blocks — this is far larger than what is actually on disk.
-
-**Limitation:** Measured on this machine:
-
-| File | Apparent | Actual | Overstated |
-|---|---|---|---|
-| `Docker.raw` | 63.9 GB | 16.7 GB | **3.8×** |
-| `podman-machine-default-arm64.raw` | 49.3 GB | 14.2 GB | **3.5×** |
-| `rootfs.img` | 10.7 GB | 5.9 GB | 1.8× |
-| Parallels `.hds`, Windows `.iso`, Android `.qcow2` | — | — | not sparse (1.0×) |
-
-Those three files alone overstate by roughly **87 GB**. That inflates the *Virtual Machines* category and a large share of the **pending review** total. It does **not** affect *reclaimable* — caches are not sparse — so the deletion path is unaffected. The harm is misdirection: a user deciding where to investigate is pointed at the wrong things. This caused a real misjudgement in session, where VM images were described as the machine's dominant consumers when their true footprint was under a third of the reported figure.
-
-**Why extension-based detection will not work:** sparseness is not predictable from the filename. `.raw` was sparse here; `.qcow2`, `.hds` and `.iso` were not. Only measurement distinguishes them.
-
-**Closing this gap requires — three viable approaches, costed:**
-
-1. **P/Invoke `stat`/`statx` and read `st_blocks`** — fastest and correct for every file, no process spawn. Cost: the struct layout differs between macOS and Linux and must be marshalled per platform, so roughly half a day plus real testing on both. **Tension:** the project takes no native dependencies; a libc P/Invoke is not a NuGet package but it is a meaningful step away from "pure BCL". Needs a deliberate decision about that boundary. — **pending**
-2. **Shell out to `stat -f %b` (macOS) / `stat -c %b` (Linux), only for files above a size threshold** — measured at ~4 ms per spawn, and only files above ~1 GB can misreport by an amount anyone cares about, so the added cost is tens of milliseconds on a 220k-file scan. No native dependency. Roughly two hours including the platform branch and a fallback when `stat` is absent. **Recommended.** — **pending**
-3. **Report both figures and label them** — cheapest, no measurement at all: state in reports that VM-image sizes are apparent. Does not fix the category totals. — **partial: `EstimatedBenefit` on the Docker and Podman rules now carries this warning (commit `8c87c4b`), but the numeric totals remain inflated**
-
-**Active mitigation:** commit `8c87c4b` added an explicit warning to the `EstimatedBenefit` text of both VM-image rules. That is a label on the symptom, not a fix.
-
-**Priority:** Medium — no data-loss or deletion-path impact, but it materially misdirects attention, which is most of what a reporting tool is for.
-
-**Related:** Lessons — "Adversarial probing beats assertion-counting" (this was found by comparing tool output against `du`, not by any test).
-
----
-
 ### 2026-07-21 — Cleaner's pre-move recheck verifies size only
 
 **Current State:** Before each move, `Cleaner` re-`stat`s the file and skips it if `SizeBytes` differs from what `evaluate` approved (`src/Cleaner.fsx:122-134`).
@@ -394,6 +363,22 @@ Those three files alone overstate by roughly **87 GB**. That inflates the *Virtu
 
 > Entries moved here when the underlying condition no longer applies.
 > Kept for historical context.
+
+### Archived 2026-07-21 — Sparse files were reported at apparent size
+
+**Resolution:** Commit `4ad9c53`, using option 2 from the original write-up. `FileMeta.SizeBytes` now means disk occupancy — which is what all 38 of its consumers already wanted, so no call site changed — with `ApparentBytes` carrying the logical length alongside. Allocation is read from `stat` (512-byte blocks) only for files at or above 1 GiB; a failed or unavailable `stat` falls back to apparent size, so the change can only improve accuracy, never break a scan. Windows returns None.
+
+**Verified against `du`:** Podman image 49.4 GB apparent → 14.2 GB reported (du: 13G); Docker.raw 64.0 GB → 16.7 GB (du: 16G). *Virtual Machines* category went from ~105 GB to **28.9 GB**; pending review from 126.0 GB to **46.5 GB**.
+
+**Two estimates in the original write-up were wrong, and both are worth recording:**
+1. I costed a `stat` spawn at ~4 ms by timing the shell binary. Via .NET `Process.Start` it is **~24 ms** — 6× higher. Timing a shell command is not a valid proxy for the same work from a managed process.
+2. I first read a 90s → 126s scan-time change as a regression caused by the probe. An A/B with `git stash` showed **119.3s without the probe and 111.4s with it** — the swing was run variance. A single before/after timing on a 2-minute I/O-bound workload cannot resolve a difference this small; only the A/B could.
+
+The conclusion survived both errors because the file count above the threshold is tiny, but it survived by luck rather than by the reasoning being sound.
+
+**Original limitation:** `FileInfo.Length` reports logical extent, overstating sparse files 3.5–3.8× and inflating category totals by ~87 GB on this machine.
+
+---
 
 ### Archived 2026-07-21 — No test proved a CLI flag had an observable effect
 
