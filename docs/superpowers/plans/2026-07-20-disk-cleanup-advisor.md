@@ -1313,4 +1313,1825 @@ are incremented once per filesystem entry across threads."
 
 ---
 
-**Remaining tasks (5–17) follow in the next section of this plan.**
+### Task 5: Platform detection and FileSystemOps
+
+**Files:**
+- Create: `src/Platform.fsx`
+- Create: `tests/TestPlatform.fsx`
+- Modify: `tests/Tests.fsx`
+
+**Interfaces:**
+- Consumes: `Types`, `Utilities`
+- Produces:
+  - `Platform.current : unit -> Types.Platform`
+  - `Platform.home : unit -> string`
+  - `Platform.isElevated : unit -> bool`
+  - `Platform.resolve : PathSpec -> string option` (None when the variable is unset)
+  - `Platform.FileSystemOps` (record type — see below)
+  - `Platform.FileSystem.real : FileSystemOps`
+  - `Platform.FileSystem.inMemory : TreeEntry list -> FileSystemOps`
+  - `Platform.TreeEntry` = `{ Path: string; SizeBytes: int64; IsDirectory: bool; LinkTarget: string option; ModifiedDaysAgo: float }`
+
+**Verified environment facts for this task:**
+- `Environment.SpecialFolder.UserProfile` → `/Users/etholpalmer` on macOS.
+- `Environment.SpecialFolder.ApplicationData` and `LocalApplicationData` both → `~/Library/Application Support` on macOS. They are **not** distinct there; do not rely on the difference.
+- `DriveInfo("/").DriveFormat` → `apfs`. Use `DriveInfo.Name` for filesystem-boundary comparison.
+- `EnumerationOptions(IgnoreInaccessible = true)` suppresses permission exceptions during enumeration. The walker still needs explicit `Result` handling for the *initial* directory open, which `IgnoreInaccessible` does not cover.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/TestPlatform.fsx`:
+
+```fsharp
+#load "TestFramework.fsx"
+#load "../src/Platform.fsx"
+open System
+open TestFramework
+open Types
+open Platform
+
+let run () =
+    suite "Platform"
+
+    test "current returns one of the three supported platforms" (fun () ->
+        let p = current ()
+        assertTrue (p = MacOS || p = Linux || p = Windows) "recognized platform")
+
+    test "home resolves to an existing directory" (fun () ->
+        let h = home ()
+        assertTrue (h.Length > 0) "home is non-empty"
+        assertTrue (IO.Directory.Exists h) "home exists")
+
+    test "resolve expands a home-relative spec" (fun () ->
+        match resolve (HomeRelative "Library/Caches") with
+        | Some path ->
+            assertTrue (path.StartsWith(home ())) "resolved under home"
+            assertContains "Caches" path "retains the relative part"
+        | None -> assertTrue false "HomeRelative should always resolve")
+
+    test "resolve returns None for an unset environment variable" (fun () ->
+        assertEqual None (resolve (EnvRelative("DEFINITELY_NOT_SET_XYZ", "sub"))) "unset variable yields None")
+
+    test "resolve passes an absolute spec through unchanged" (fun () ->
+        assertEqual (Some "/tmp") (resolve (Absolute "/tmp")) "absolute preserved")
+
+    suite "Platform.FileSystem.inMemory"
+
+    let tree =
+        [ { Path = "/root"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+          { Path = "/root/a.log"; SizeBytes = 100L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 10.0 }
+          { Path = "/root/b.txt"; SizeBytes = 200L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 2.0 }
+          { Path = "/root/sub"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
+          { Path = "/root/sub/c.log"; SizeBytes = 300L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 90.0 }
+          { Path = "/root/link"; SizeBytes = 0L; IsDirectory = false; LinkTarget = Some "/elsewhere"; ModifiedDaysAgo = 1.0 } ]
+
+    let fs = FileSystem.inMemory tree
+
+    test "enumerates immediate children only" (fun () ->
+        let files = assertOk (fs.EnumerateFiles "/root") "enumerate /root files"
+        assertEqual 3 files.Length "a.log, b.txt, link — not sub/c.log"
+        let dirs = assertOk (fs.EnumerateDirectories "/root") "enumerate /root dirs"
+        assertEqual [| "/root/sub" |] dirs "one subdirectory")
+
+    test "reports metadata for a known file" (fun () ->
+        let meta = assertOk (fs.GetInfo "/root/a.log") "get info"
+        assertEqual 100L meta.SizeBytes "size"
+        assertFalse meta.IsDirectory "not a directory"
+        assertEqual None meta.LinkTarget "not a link")
+
+    test "reports link targets so the walker can refuse to follow them" (fun () ->
+        let meta = assertOk (fs.GetInfo "/root/link") "get link info"
+        assertTrue (FileMeta.isLink meta) "recognized as a link")
+
+    test "returns PathNotFound for an absent path" (fun () ->
+        let err = assertError (fs.GetInfo "/root/nope") "absent path"
+        assertEqual (PathNotFound "/root/nope") err "PathNotFound")
+
+    test "modified times are back-dated so age rules can be tested" (fun () ->
+        let meta = assertOk (fs.GetInfo "/root/sub/c.log") "get aged file"
+        let age = FileMeta.age DateTime.UtcNow meta
+        assertTrue (age.TotalDays > 89.0 && age.TotalDays < 91.0) "roughly 90 days old")
+```
+
+- [ ] **Step 2: Wire into the test entry point**
+
+Modify `tests/Tests.fsx` — add `#load "TestPlatform.fsx"` and `TestPlatform.run ()`.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: FAIL — cannot find `../src/Platform.fsx`.
+
+- [ ] **Step 4: Write Platform.fsx**
+
+Create `src/Platform.fsx`:
+
+```fsharp
+(**
+    Platform detection, known-folder resolution, and the filesystem boundary.
+
+    All filesystem access in this project goes through `FileSystemOps`, a record
+    of functions rather than an interface. Two implementations exist: `real`,
+    which touches the disk, and `inMemory`, which serves a synthetic tree. Every
+    module above this one is written against the record, so the entire scanning
+    and risk pipeline is testable without creating a single file.
+
+    Every operation returns Result. Permission denial is the common case on
+    macOS, not an edge case: TCC blocks ~/Library/Containers, ~/Library/Mail,
+    and others unless the invoking terminal has Full Disk Access.
+*)
+module Platform
+
+open System
+open System.IO
+open System.Runtime.InteropServices
+
+#load "Types.fsx"
+#load "Utilities.fsx"
+open Types
+open Utilities
+
+/// The operating system this process is running on.
+let current () : Types.Platform =
+    if RuntimeInformation.IsOSPlatform OSPlatform.OSX then MacOS
+    elif RuntimeInformation.IsOSPlatform OSPlatform.Windows then Windows
+    else Linux
+
+/// The invoking user's home directory.
+let home () : string =
+    Environment.GetFolderPath Environment.SpecialFolder.UserProfile
+
+/// True when the process is running with elevated privileges.
+///
+/// The tool refuses to run elevated unless `--allow-root` is passed, because
+/// an elevated scan can reach — and a bug could then remove — system files
+/// that an ordinary user account is protected from.
+let isElevated () : bool =
+    match current () with
+    | Windows ->
+        // On Windows, an elevated process can write to the system directory.
+        try
+            let probe = Path.Combine(Environment.GetFolderPath Environment.SpecialFolder.Windows, "elevation.probe")
+            use _ = File.Create(probe, 1, FileOptions.DeleteOnClose)
+            true
+        with _ -> false
+    | MacOS | Linux ->
+        // getuid() returns 0 for root. SUDO_USER additionally catches `sudo`.
+        Environment.GetEnvironmentVariable "USER" = "root"
+        || not (String.IsNullOrEmpty(Environment.GetEnvironmentVariable "SUDO_USER"))
+
+/// Resolves a PathSpec against the current environment.
+/// Returns None when an environment variable the spec depends on is unset,
+/// which is how rules for absent tooling are dropped at startup.
+let resolve (spec: PathSpec) : string option =
+    match spec with
+    | Absolute path -> Some (Utilities.Path.normalize path)
+    | HomeRelative relative ->
+        Some (Utilities.Path.normalize (Path.Combine(home (), relative)))
+    | EnvRelative (variable, relative) ->
+        match Environment.GetEnvironmentVariable variable with
+        | null | "" -> None
+        | value -> Some (Utilities.Path.normalize (Path.Combine(value, relative)))
+
+/// The filesystem operations every other module depends on.
+/// A record of functions rather than an interface, so substituting a fake in
+/// tests is a value assignment rather than a type hierarchy.
+type FileSystemOps =
+    { /// Immediate subdirectories of a directory.
+      EnumerateDirectories: string -> Result<string[], FsError>
+      /// Immediate files within a directory.
+      EnumerateFiles: string -> Result<string[], FsError>
+      /// Metadata for a single entry.
+      GetInfo: string -> Result<FileMeta, FsError>
+      /// Opens a file for reading. The caller disposes the stream.
+      OpenRead: string -> Result<Stream, FsError>
+      /// True when the path exists as a file or directory.
+      Exists: string -> bool
+      /// The filesystem identity of a path, for boundary detection.
+      VolumeOf: string -> Result<string, FsError> }
+
+/// A synthetic filesystem entry for the in-memory implementation.
+type TreeEntry =
+    { Path: string
+      SizeBytes: int64
+      IsDirectory: bool
+      LinkTarget: string option
+      /// How long ago the entry was last modified, so age rules are testable.
+      ModifiedDaysAgo: float }
+
+module FileSystem =
+
+    /// Converts a BCL exception into the corresponding FsError.
+    let private classify (path: string) (ex: exn) : FsError =
+        match ex with
+        | :? UnauthorizedAccessException -> PermissionDenied path
+        | :? DirectoryNotFoundException | :? FileNotFoundException -> PathNotFound path
+        | :? PathTooLongException -> PathTooLong path
+        | :? NotSupportedException as e -> NotSupported(path, e.Message)
+        | e -> IoFailure(path, e.Message)
+
+    /// Enumeration settings shared by the real implementation.
+    /// IgnoreInaccessible lets a partially-readable directory still yield its
+    /// readable entries instead of failing wholesale.
+    let private enumerationOptions =
+        EnumerationOptions(
+            IgnoreInaccessible = true,
+            RecurseSubdirectories = false,
+            ReturnSpecialDirectories = false)
+
+    /// The real filesystem.
+    let real: FileSystemOps =
+        { EnumerateDirectories = fun path ->
+            try Ok (Directory.GetDirectories(path, "*", enumerationOptions))
+            with ex -> Error (classify path ex)
+
+          EnumerateFiles = fun path ->
+            try Ok (Directory.GetFiles(path, "*", enumerationOptions))
+            with ex -> Error (classify path ex)
+
+          GetInfo = fun path ->
+            try
+                let isDirectory = Directory.Exists path
+                if not isDirectory && not (File.Exists path) then Error (PathNotFound path)
+                else
+                    let info: FileSystemInfo =
+                        if isDirectory then DirectoryInfo path :> FileSystemInfo
+                        else FileInfo path :> FileSystemInfo
+                    let size =
+                        match info with
+                        | :? FileInfo as f -> f.Length
+                        | _ -> 0L
+                    let mode =
+                        if current () = Windows then ""
+                        else
+                            try string (File.GetUnixFileMode path) with _ -> ""
+                    Ok { Path = path
+                         SizeBytes = size
+                         LastAccess = info.LastAccessTimeUtc
+                         LastModified = info.LastWriteTimeUtc
+                         Created = info.CreationTimeUtc
+                         IsDirectory = isDirectory
+                         LinkTarget = (if isNull info.LinkTarget then None else Some info.LinkTarget)
+                         Owner = Environment.UserName
+                         Mode = mode }
+            with ex -> Error (classify path ex)
+
+          OpenRead = fun path ->
+            try Ok (File.OpenRead path :> Stream)
+            with ex -> Error (classify path ex)
+
+          Exists = fun path -> File.Exists path || Directory.Exists path
+
+          VolumeOf = fun path ->
+            try
+                let root = Path.GetPathRoot(Path.GetFullPath path)
+                Ok (DriveInfo(root).Name)
+            with ex -> Error (classify path ex) }
+
+    /// A synthetic filesystem backed by a list of entries.
+    /// Paths are matched after normalization, so tests may write them in any
+    /// separator style.
+    let inMemory (entries: TreeEntry list) : FileSystemOps =
+        let now = DateTime.UtcNow
+        let byPath =
+            entries
+            |> List.map (fun e -> Utilities.Path.normalize e.Path, e)
+            |> Map.ofList
+
+        let toMeta (e: TreeEntry) : FileMeta =
+            let modified = now.AddDays(-e.ModifiedDaysAgo)
+            { Path = e.Path
+              SizeBytes = e.SizeBytes
+              LastAccess = modified
+              LastModified = modified
+              Created = modified
+              IsDirectory = e.IsDirectory
+              LinkTarget = e.LinkTarget
+              Owner = "testuser"
+              Mode = "rw-r--r--" }
+
+        /// Immediate children of a directory: descendants with exactly one
+        /// additional path segment.
+        let childrenOf (parent: string) =
+            let p = Utilities.Path.normalize parent
+            let depth = (Utilities.Path.segments p).Length
+            byPath
+            |> Map.toList
+            |> List.map snd
+            |> List.filter (fun e ->
+                Utilities.Path.isDescendantOf p e.Path
+                && (Utilities.Path.segments (Utilities.Path.normalize e.Path)).Length = depth + 1)
+
+        { EnumerateDirectories = fun path ->
+            if not (byPath.ContainsKey(Utilities.Path.normalize path)) then Error (PathNotFound path)
+            else Ok (childrenOf path |> List.filter (fun e -> e.IsDirectory)
+                                     |> List.map (fun e -> e.Path) |> List.toArray)
+
+          EnumerateFiles = fun path ->
+            if not (byPath.ContainsKey(Utilities.Path.normalize path)) then Error (PathNotFound path)
+            else Ok (childrenOf path |> List.filter (fun e -> not e.IsDirectory)
+                                     |> List.map (fun e -> e.Path) |> List.toArray)
+
+          GetInfo = fun path ->
+            match byPath.TryFind(Utilities.Path.normalize path) with
+            | Some e -> Ok (toMeta e)
+            | None -> Error (PathNotFound path)
+
+          OpenRead = fun path ->
+            match byPath.TryFind(Utilities.Path.normalize path) with
+            | Some e when not e.IsDirectory ->
+                // Deterministic synthetic content sized to match the entry, so
+                // hashing tests produce stable results.
+                Ok (new MemoryStream(Array.create (int e.SizeBytes) 0uy) :> Stream)
+            | Some _ -> Error (NotSupported(path, "cannot read a directory"))
+            | None -> Error (PathNotFound path)
+
+          Exists = fun path -> byPath.ContainsKey(Utilities.Path.normalize path)
+
+          VolumeOf = fun _ -> Ok "/testvolume" }
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: PASS — 36 tests total.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/Platform.fsx tests/TestPlatform.fsx tests/Tests.fsx
+git commit -m "feat: add platform detection and FileSystemOps abstraction
+
+FileSystemOps is a record of functions with real and in-memory
+implementations, so the scanning and risk pipeline is testable
+without touching disk. Real enumeration uses IgnoreInaccessible so a
+partially-readable directory still yields its readable entries."
+```
+
+---
+
+### Task 6: Configuration
+
+**Files:**
+- Create: `src/Configuration.fsx`
+- Create: `tests/TestConfiguration.fsx`
+- Modify: `tests/Tests.fsx`
+
+**Interfaces:**
+- Consumes: `Types`, `Utilities`, `Platform`
+- Produces:
+  - `Configuration.Config` = `{ IgnorePaths: string list; IgnoreExtensions: string list; MinSizeBytes: int64; AgeThresholdDays: int; ThreadCount: int; HashAlgorithm: string; RiskOverrides: Map<string, RiskLevel> }`
+  - `Configuration.defaults : Config`
+  - `Configuration.parse : string -> Result<Config, string list>`
+  - `Configuration.load : FileSystemOps -> string option -> Result<Config, string list>`
+  - `Configuration.defaultPath : unit -> string`
+
+**Critical rule:** a `riskOverride` may only **raise** severity. An override lowering a rule's risk is a validation **error**, not a silent clamp — silently ignoring it would leave the user believing they had loosened a restriction.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/TestConfiguration.fsx`:
+
+```fsharp
+#load "TestFramework.fsx"
+#load "../src/Configuration.fsx"
+open TestFramework
+open Types
+open Configuration
+
+let run () =
+    suite "Configuration.parse"
+
+    test "an empty object yields the defaults" (fun () ->
+        let c = assertOk (parse "{}") "empty object parses"
+        assertEqual defaults.MinSizeBytes c.MinSizeBytes "default min size"
+        assertEqual defaults.ThreadCount c.ThreadCount "default thread count")
+
+    test "supplied values override the defaults" (fun () ->
+        let json = """{"minSizeBytes": 2048, "ageThresholdDays": 60, "threadCount": 4}"""
+        let c = assertOk (parse json) "parses"
+        assertEqual 2048L c.MinSizeBytes "min size"
+        assertEqual 60 c.AgeThresholdDays "age threshold"
+        assertEqual 4 c.ThreadCount "thread count")
+
+    test "ignore paths are expanded and normalized" (fun () ->
+        let json = """{"ignorePaths": ["~/Projects/active", "/tmp//x/"]}"""
+        let c = assertOk (parse json) "parses"
+        assertEqual 2 c.IgnorePaths.Length "two paths"
+        assertFalse (c.IgnorePaths |> List.exists (fun p -> p.StartsWith "~")) "tilde expanded"
+        assertTrue (c.IgnorePaths |> List.contains "/tmp/x") "normalized")
+
+    test "extensions are normalized to lowercase with a leading dot" (fun () ->
+        let json = """{"ignoreExtensions": ["PSD", ".Sketch"]}"""
+        let c = assertOk (parse json) "parses"
+        assertEqual [ ".psd"; ".sketch" ] c.IgnoreExtensions "normalized extensions")
+
+    test "malformed JSON reports an error rather than throwing" (fun () ->
+        let errors = assertError (parse "{ not json") "malformed input"
+        assertTrue (errors.Length >= 1) "at least one error"
+        assertContains "JSON" (List.head errors) "mentions JSON")
+
+    suite "Configuration validation"
+
+    test "every validation error is reported at once" (fun () ->
+        let json = """{"minSizeBytes": -1, "threadCount": 0, "ageThresholdDays": -5}"""
+        let errors = assertError (parse json) "three invalid values"
+        assertEqual 3 errors.Length "all three errors reported together")
+
+    test "thread count above 64 is rejected" (fun () ->
+        let errors = assertError (parse """{"threadCount": 128}""") "excessive thread count"
+        assertContains "threadCount" (List.head errors) "names the field")
+
+    test "an unknown hash algorithm is rejected" (fun () ->
+        let errors = assertError (parse """{"hashAlgorithm": "crc32"}""") "unsupported algorithm"
+        assertContains "hashAlgorithm" (List.head errors) "names the field")
+
+    test "sha256 and md5 are both accepted" (fun () ->
+        assertEqual "sha256" (assertOk (parse """{"hashAlgorithm": "SHA256"}""") "sha256").HashAlgorithm "sha256 normalized"
+        assertEqual "md5" (assertOk (parse """{"hashAlgorithm": "MD5"}""") "md5").HashAlgorithm "md5 normalized")
+
+    suite "Configuration risk overrides"
+
+    test "an override that raises severity is accepted" (fun () ->
+        let json = """{"riskOverrides": {"Homebrew Cache": "Review"}}"""
+        let c = assertOk (parse json) "raising override accepted"
+        assertEqual (Some Review) (c.RiskOverrides.TryFind "Homebrew Cache") "override recorded")
+
+    test "an override to NeverDelete is accepted" (fun () ->
+        let json = """{"riskOverrides": {"Xcode DerivedData": "NeverDelete"}}"""
+        let c = assertOk (parse json) "maximum severity accepted"
+        assertEqual (Some NeverDelete) (c.RiskOverrides.TryFind "Xcode DerivedData") "override recorded")
+
+    test "an unknown risk level name is rejected" (fun () ->
+        let errors = assertError (parse """{"riskOverrides": {"Some Rule": "Whatever"}}""") "bad level"
+        assertContains "Whatever" (List.head errors) "names the offending value")
+```
+
+Note: the *lowering* rejection is enforced in `RiskEngine` (Task 8), because only there is a rule's declared risk known. `Configuration` validates that the level parses; `RiskEngine` validates the direction. Task 8 tests that.
+
+- [ ] **Step 2: Wire into the test entry point**
+
+Modify `tests/Tests.fsx` — add `#load "TestConfiguration.fsx"` and `TestConfiguration.run ()`.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: FAIL — cannot find `../src/Configuration.fsx`.
+
+- [ ] **Step 4: Write Configuration.fsx**
+
+Create `src/Configuration.fsx`:
+
+```fsharp
+(**
+    JSON configuration loading, validation, and merging over defaults.
+
+    Validation accumulates every error rather than stopping at the first, so a
+    user with three mistakes fixes them in one pass instead of three runs.
+
+    Parsing is done against JsonDocument rather than deserializing into an F#
+    record directly: System.Text.Json cannot handle F# discriminated unions and
+    silently accepts unknown fields, both of which we want to control here.
+*)
+module Configuration
+
+open System
+open System.Text.Json
+
+#load "Types.fsx"
+#load "Utilities.fsx"
+#load "Platform.fsx"
+open Types
+open Utilities
+
+/// User-supplied settings, merged over `defaults`.
+type Config =
+    { /// Absolute paths excluded from scanning entirely.
+      IgnorePaths: string list
+      /// Lowercase extensions (with leading dot) excluded from results.
+      IgnoreExtensions: string list
+      /// Files below this size are ignored for hashing and large-file reporting.
+      MinSizeBytes: int64
+      /// Items younger than this are not considered stale.
+      AgeThresholdDays: int
+      /// Traversal parallelism.
+      ThreadCount: int
+      /// "sha256" or "md5".
+      HashAlgorithm: string
+      /// Rule name to a replacement risk level. May only raise severity;
+      /// the direction is enforced by RiskEngine, which knows declared risks.
+      RiskOverrides: Map<string, RiskLevel> }
+
+/// Settings used when no configuration file is present.
+let defaults: Config =
+    { IgnorePaths = []
+      IgnoreExtensions = []
+      MinSizeBytes = 1_048_576L
+      AgeThresholdDays = 30
+      ThreadCount = min Environment.ProcessorCount 8
+      HashAlgorithm = "sha256"
+      RiskOverrides = Map.empty }
+
+/// The conventional configuration location when `--config` is not supplied.
+let defaultPath () : string =
+    IO.Path.Combine(
+        Environment.GetFolderPath Environment.SpecialFolder.UserProfile,
+        ".config", "diskcleanupadvisor", "config.json")
+
+/// Reads an optional property, returning None when absent or null.
+let private tryProperty (root: JsonElement) (name: string) : JsonElement option =
+    match root.TryGetProperty name with
+    | true, value when value.ValueKind <> JsonValueKind.Null -> Some value
+    | _ -> None
+
+/// Reads an optional string array.
+let private readStringArray (root: JsonElement) (name: string) : Result<string list option, string> =
+    match tryProperty root name with
+    | None -> Ok None
+    | Some value when value.ValueKind = JsonValueKind.Array ->
+        value.EnumerateArray()
+        |> Seq.map (fun e -> e.GetString())
+        |> Seq.filter (isNull >> not)
+        |> Seq.toList
+        |> Some
+        |> Ok
+    | Some _ -> Error (sprintf "%s must be an array of strings" name)
+
+/// Reads an optional integer.
+let private readInt (root: JsonElement) (name: string) : Result<int option, string> =
+    match tryProperty root name with
+    | None -> Ok None
+    | Some value when value.ValueKind = JsonValueKind.Number ->
+        match value.TryGetInt32() with
+        | true, n -> Ok (Some n)
+        | _ -> Error (sprintf "%s must be a 32-bit integer" name)
+    | Some _ -> Error (sprintf "%s must be a number" name)
+
+/// Reads an optional 64-bit integer.
+let private readInt64 (root: JsonElement) (name: string) : Result<int64 option, string> =
+    match tryProperty root name with
+    | None -> Ok None
+    | Some value when value.ValueKind = JsonValueKind.Number ->
+        match value.TryGetInt64() with
+        | true, n -> Ok (Some n)
+        | _ -> Error (sprintf "%s must be a 64-bit integer" name)
+    | Some _ -> Error (sprintf "%s must be a number" name)
+
+/// Reads an optional string.
+let private readString (root: JsonElement) (name: string) : Result<string option, string> =
+    match tryProperty root name with
+    | None -> Ok None
+    | Some value when value.ValueKind = JsonValueKind.String -> Ok (Some (value.GetString()))
+    | Some _ -> Error (sprintf "%s must be a string" name)
+
+/// Reads the riskOverrides object, parsing each level name.
+let private readOverrides (root: JsonElement) : Result<Map<string, RiskLevel> option, string list> =
+    match tryProperty root "riskOverrides" with
+    | None -> Ok None
+    | Some value when value.ValueKind = JsonValueKind.Object ->
+        let parsed =
+            value.EnumerateObject()
+            |> Seq.map (fun prop ->
+                if prop.Value.ValueKind <> JsonValueKind.String then
+                    Error (sprintf "riskOverrides.%s must be a string" prop.Name)
+                else
+                    match RiskLevel.parse (prop.Value.GetString()) with
+                    | Ok level -> Ok (prop.Name, level)
+                    | Error message -> Error (sprintf "riskOverrides.%s: %s" prop.Name message))
+            |> Seq.toList
+        let errors = parsed |> List.choose (function Error e -> Some e | Ok _ -> None)
+        if List.isEmpty errors then
+            Ok (Some (parsed |> List.choose (function Ok kv -> Some kv | Error _ -> None) |> Map.ofList))
+        else Error errors
+    | Some _ -> Error [ "riskOverrides must be an object" ]
+
+/// Validates a fully-merged configuration, returning every problem found.
+let private validate (config: Config) : Result<Config, string list> =
+    let errors =
+        [ if config.MinSizeBytes < 0L then
+            yield sprintf "minSizeBytes must be zero or greater (got %d)" config.MinSizeBytes
+          if config.AgeThresholdDays < 0 then
+            yield sprintf "ageThresholdDays must be zero or greater (got %d)" config.AgeThresholdDays
+          if config.ThreadCount < 1 then
+            yield sprintf "threadCount must be at least 1 (got %d)" config.ThreadCount
+          elif config.ThreadCount > 64 then
+            yield sprintf "threadCount must be 64 or fewer (got %d)" config.ThreadCount
+          if config.HashAlgorithm <> "sha256" && config.HashAlgorithm <> "md5" then
+            yield sprintf "hashAlgorithm must be 'sha256' or 'md5' (got '%s')" config.HashAlgorithm ]
+    if List.isEmpty errors then Ok config else Error errors
+
+/// Parses configuration JSON, merging supplied values over the defaults.
+/// Returns every validation error at once.
+let parse (json: string) : Result<Config, string list> =
+    let documentResult =
+        try Ok (JsonDocument.Parse json)
+        with :? JsonException as ex -> Error [ sprintf "invalid JSON: %s" ex.Message ]
+
+    match documentResult with
+    | Error errors -> Error errors
+    | Ok document ->
+        use document = document
+        let root = document.RootElement
+        if root.ValueKind <> JsonValueKind.Object then
+            Error [ "configuration root must be a JSON object" ]
+        else
+            // Collect field-level read errors before validating semantics.
+            let ignorePaths = readStringArray root "ignorePaths"
+            let ignoreExtensions = readStringArray root "ignoreExtensions"
+            let minSize = readInt64 root "minSizeBytes"
+            let ageThreshold = readInt root "ageThresholdDays"
+            let threadCount = readInt root "threadCount"
+            let hashAlgorithm = readString root "hashAlgorithm"
+            let overrides = readOverrides root
+
+            let readErrors =
+                [ match ignorePaths with Error e -> yield e | _ -> ()
+                  match ignoreExtensions with Error e -> yield e | _ -> ()
+                  match minSize with Error e -> yield e | _ -> ()
+                  match ageThreshold with Error e -> yield e | _ -> ()
+                  match threadCount with Error e -> yield e | _ -> ()
+                  match hashAlgorithm with Error e -> yield e | _ -> ()
+                  match overrides with Error es -> yield! es | _ -> () ]
+
+            if not (List.isEmpty readErrors) then Error readErrors
+            else
+                let pick result fallback =
+                    match result with
+                    | Ok (Some v) -> v
+                    | _ -> fallback
+
+                let merged =
+                    { IgnorePaths =
+                        pick ignorePaths defaults.IgnorePaths
+                        |> List.map (Utilities.Path.expandHome >> Utilities.Path.normalize)
+                      IgnoreExtensions =
+                        pick ignoreExtensions defaults.IgnoreExtensions
+                        |> List.map (fun e ->
+                            let lower = e.Trim().ToLowerInvariant()
+                            if lower.StartsWith "." then lower else "." + lower)
+                      MinSizeBytes = pick minSize defaults.MinSizeBytes
+                      AgeThresholdDays = pick ageThreshold defaults.AgeThresholdDays
+                      ThreadCount = pick threadCount defaults.ThreadCount
+                      HashAlgorithm = (pick hashAlgorithm defaults.HashAlgorithm).Trim().ToLowerInvariant()
+                      RiskOverrides = pick overrides defaults.RiskOverrides }
+
+                validate merged
+
+/// Loads configuration from an explicit path, the conventional path, or
+/// falls back to defaults when neither exists.
+///
+/// An explicitly requested path that is missing is an error; a missing
+/// conventional path is not.
+let load (fs: Platform.FileSystemOps) (explicitPath: string option) : Result<Config, string list> =
+    let readFile path =
+        try Ok (IO.File.ReadAllText path)
+        with ex -> Error [ sprintf "cannot read %s: %s" path ex.Message ]
+
+    match explicitPath with
+    | Some path ->
+        if not (fs.Exists path) then Error [ sprintf "configuration file not found: %s" path ]
+        else readFile path |> Result.bind parse
+    | None ->
+        let conventional = defaultPath ()
+        if fs.Exists conventional then readFile conventional |> Result.bind parse
+        else Ok defaults
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: PASS — 49 tests total.
+
+- [ ] **Step 6: Verify error accumulation by hand**
+
+```bash
+cat > /tmp/cfgprobe.fsx <<'EOF'
+#load "src/Configuration.fsx"
+match Configuration.parse """{"minSizeBytes": -1, "threadCount": 0, "hashAlgorithm": "crc32"}""" with
+| Ok _ -> printfn "UNEXPECTED: should have failed"
+| Error errors -> errors |> List.iter (printfn "  - %s")
+EOF
+dotnet fsi /tmp/cfgprobe.fsx && rm /tmp/cfgprobe.fsx
+```
+
+Expected: exactly three bullet lines, one per invalid field. If only one appears, `validate` is short-circuiting and must be fixed.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/Configuration.fsx tests/TestConfiguration.fsx tests/Tests.fsx
+git commit -m "feat: add JSON configuration with accumulating validation
+
+Parses against JsonDocument rather than deserializing to an F# record,
+since System.Text.Json cannot handle discriminated unions. Every
+validation error is reported at once so users fix them in one pass."
+```
+
+---
+
+### Task 7: Rule catalog
+
+**Files:**
+- Create: `src/Rules.fsx`
+- Create: `tests/TestRules.fsx`
+- Modify: `tests/Tests.fsx`
+
+**Interfaces:**
+- Consumes: `Types`, `Utilities`, `Platform`
+- Produces:
+  - `Rules.Rule` (record — full definition below)
+  - `Rules.ResolvedRule` = `{ Rule: Rule; Root: string }`
+  - `Rules.catalog : Rule list`
+  - `Rules.forPlatform : Types.Platform -> Rule list`
+  - `Rules.resolveAll : Platform.FileSystemOps -> Types.Platform -> ResolvedRule list`
+  - `Rules.byPrecedence : ResolvedRule list -> ResolvedRule list`
+
+**Precedence rule:** most-specific-first by resolved root path **length descending**, then declaration order. This is what lets `Containers/*/Data/Library/Caches` (Safe) win over `Containers/**` (Review).
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/TestRules.fsx`:
+
+```fsharp
+#load "TestFramework.fsx"
+#load "../src/Rules.fsx"
+open System
+open TestFramework
+open Types
+open Rules
+
+let run () =
+    suite "Rules.catalog"
+
+    test "every rule has a non-empty name, description, and reason" (fun () ->
+        for rule in catalog do
+            assertTrue (rule.Name.Length > 0) "name is non-empty"
+            assertTrue (rule.Description.Length > 0) (sprintf "%s has a description" rule.Name)
+            assertTrue (rule.Reason.Length > 0) (sprintf "%s has a reason" rule.Name)
+            assertTrue (rule.Examples.Length > 0) (sprintf "%s has at least one example" rule.Name))
+
+    test "rule names are unique" (fun () ->
+        let names = catalog |> List.map (fun r -> r.Name)
+        assertEqual names.Length (names |> List.distinct |> List.length) "no duplicate rule names")
+
+    test "every rule declares at least one platform" (fun () ->
+        for rule in catalog do
+            assertFalse (Set.isEmpty rule.Platforms) (sprintf "%s declares a platform" rule.Name))
+
+    test "only Safe rules may assert SafeToDelete" (fun () ->
+        // A rule claiming deletability at any other risk level is a
+        // contradiction the risk engine would have to resolve at runtime.
+        for rule in catalog do
+            if rule.SafeToDelete then
+                assertEqual Safe rule.Risk (sprintf "%s asserts SafeToDelete so must be Safe" rule.Name))
+
+    test "no rule targets a protected user data location" (fun () ->
+        let forbidden = [ "Documents"; "Desktop"; "Pictures"; "Movies"; "Music" ]
+        for rule in catalog do
+            if rule.SafeToDelete then
+                for segment in forbidden do
+                    let root = match rule.Root with
+                               | HomeRelative r -> r
+                               | Absolute a -> a
+                               | EnvRelative (_, r) -> r
+                    assertFalse (root.Contains segment)
+                        (sprintf "%s must not target %s" rule.Name segment))
+
+    suite "Rules.forPlatform"
+
+    test "macOS rules are returned for macOS" (fun () ->
+        let macRules = forPlatform MacOS
+        assertTrue (macRules.Length >= 20) "macOS catalog is populated"
+        for rule in macRules do
+            assertTrue (rule.Platforms.Contains MacOS) (sprintf "%s applies to macOS" rule.Name))
+
+    test "Linux and Windows have seeded catalogs" (fun () ->
+        assertTrue ((forPlatform Linux).Length >= 4) "Linux seeded"
+        assertTrue ((forPlatform Windows).Length >= 4) "Windows seeded")
+
+    suite "Rules.byPrecedence"
+
+    test "more specific roots sort before less specific ones" (fun () ->
+        let specific =
+            { Rule = catalog |> List.head; Root = "/a/b/c/d/e" }
+        let general =
+            { Rule = catalog |> List.head; Root = "/a" }
+        let ordered = byPrecedence [ general; specific ]
+        assertEqual "/a/b/c/d/e" (List.head ordered).Root "longest root first")
+
+    test "the Containers cache rule outranks the Containers catch-all" (fun () ->
+        // This is the specific requirement from the spec: only Data/Library/Caches
+        // and Data/tmp inside ~/Library/Containers may be Safe; everything else
+        // must fall through to Review.
+        let macRules = forPlatform MacOS
+        let cacheRule = macRules |> List.tryFind (fun r -> r.Name = "Container Caches")
+        let catchAll = macRules |> List.tryFind (fun r -> r.Name = "Container Data")
+        assertTrue cacheRule.IsSome "Container Caches rule exists"
+        assertTrue catchAll.IsSome "Container Data catch-all exists"
+        assertEqual Safe cacheRule.Value.Risk "container caches are Safe"
+        assertEqual Review catchAll.Value.Risk "other container data is Review"
+        assertFalse catchAll.Value.SafeToDelete "catch-all is not deletable")
+```
+
+- [ ] **Step 2: Wire into the test entry point**
+
+Modify `tests/Tests.fsx` — add `#load "TestRules.fsx"` and `TestRules.run ()`.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: FAIL — cannot find `../src/Rules.fsx`.
+
+- [ ] **Step 4: Write Rules.fsx**
+
+Create `src/Rules.fsx`. The catalog is data; the engine never branches on a specific rule.
+
+```fsharp
+(**
+    The rule catalog.
+
+    A rule is a pure data description of a location, what lives there, and how
+    dangerous it is to remove. The scanner is parameterized over `Rule list` and
+    contains no rule-specific logic, so **adding a rule means appending a record
+    here** — no other file changes.
+
+    Two invariants are enforced by tests rather than by types, because they
+    concern combinations of fields:
+      * Only a rule at risk level `Safe` may set `SafeToDelete = true`.
+      * No `SafeToDelete` rule may target a user-data directory.
+*)
+module Rules
+
+open System
+
+#load "Types.fsx"
+#load "Utilities.fsx"
+#load "Platform.fsx"
+open Types
+open Utilities
+
+/// A declarative description of a cleanup target.
+type Rule =
+    { /// Unique, stable identifier. Referenced by config riskOverrides.
+      Name: string
+      /// Which operating systems this rule applies to.
+      Platforms: Set<Types.Platform>
+      /// Where to look, resolved against the environment at startup.
+      Root: PathSpec
+      /// Globs relative to Root. Empty means "everything under Root".
+      Include: string list
+      /// Globs relative to Root that are excluded from matching.
+      Exclude: string list
+      /// How dangerous removal is.
+      Risk: RiskLevel
+      /// How the item can be recovered after removal.
+      Recoverability: Recoverability
+      /// How matched items should be removed.
+      Strategy: DeleteStrategy
+      /// Items younger than this are not candidates. None means no age floor.
+      MinAge: TimeSpan option
+      /// Items smaller than this are not candidates. None means no size floor.
+      MinSize: int64 option
+      /// Whether this rule permits automatic deletion. Only ever true at Safe.
+      SafeToDelete: bool
+      /// What this location contains.
+      Description: string
+      /// Why it is (or is not) disposable.
+      Reason: string
+      /// Rough expected reclaim, for report prioritization.
+      EstimatedBenefit: string
+      /// Concrete example paths, shown in verbose reports.
+      Examples: string list
+      /// Report grouping.
+      Category: Category }
+
+/// A rule whose root resolved to a real, existing path on this machine.
+type ResolvedRule = { Rule: Rule; Root: string }
+
+/// Shorthand for a rule with the common defaults filled in, so each catalog
+/// entry states only what distinguishes it.
+let private rule name platforms root category =
+    { Name = name
+      Platforms = Set.ofList platforms
+      Root = root
+      Include = []
+      Exclude = []
+      Risk = Review
+      Recoverability = Unrecoverable
+      Strategy = MatchingFiles
+      MinAge = None
+      MinSize = None
+      SafeToDelete = false
+      Description = ""
+      Reason = ""
+      EstimatedBenefit = ""
+      Examples = []
+      Category = category }
+
+/// Marks a rule as safely deletable. Sets both fields together so the
+/// SafeToDelete/Risk pair can never drift apart.
+let private safe (r: Rule) = { r with Risk = Safe; SafeToDelete = true }
+
+// ---------------------------------------------------------------------------
+// macOS catalog — complete
+// ---------------------------------------------------------------------------
+
+let private macOsRules: Rule list =
+    [ { rule "User Caches" [ MacOS ] (HomeRelative "Library/Caches") Caches with
+          Strategy = ContentsOnly
+          Recoverability = Regenerated
+          Description = "Application caches for the current user."
+          Reason = "Applications regenerate these on demand. Removing them costs a one-time slowdown, nothing more."
+          EstimatedBenefit = "1-20 GB"
+          Examples = [ "~/Library/Caches/com.apple.Safari"; "~/Library/Caches/JetBrains" ] } |> safe
+
+      { rule "User Logs" [ MacOS ] (HomeRelative "Library/Logs") Logs with
+          Strategy = ContentsOnly
+          Recoverability = Regenerated
+          MinAge = Some (TimeSpan.FromDays 7.0)
+          Description = "Application log files for the current user."
+          Reason = "Diagnostic output. Only useful while investigating a recent problem."
+          EstimatedBenefit = "100 MB - 2 GB"
+          Examples = [ "~/Library/Logs/DiagnosticReports" ] } |> safe
+
+      { rule "Crash Reports" [ MacOS ] (HomeRelative "Library/Application Support/CrashReporter") CrashReports with
+          Strategy = ContentsOnly
+          Recoverability = Unrecoverable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = "Saved crash reports."
+          Reason = "Useful only when actively diagnosing a crash. Older reports refer to versions no longer installed."
+          EstimatedBenefit = "10-500 MB"
+          Examples = [ "~/Library/Application Support/CrashReporter/*.plist" ] } |> safe
+
+      { rule "Xcode DerivedData" [ MacOS ] (HomeRelative "Library/Developer/Xcode/DerivedData") DeveloperArtifacts with
+          Strategy = ContentsOnly
+          Recoverability = Regenerated
+          Description = "Xcode build intermediates, indexes, and module caches."
+          Reason = "Fully regenerated by a rebuild. Frequently the single largest reclaimable directory on a developer Mac. The directory itself is kept because Xcode expects it to exist."
+          EstimatedBenefit = "5-50 GB"
+          Examples = [ "~/Library/Developer/Xcode/DerivedData/MyApp-abc123" ] } |> safe
+
+      { rule "Xcode Archives" [ MacOS ] (HomeRelative "Library/Developer/Xcode/Archives") DeveloperArtifacts with
+          Risk = Review
+          Recoverability = Unrecoverable
+          MinAge = Some (TimeSpan.FromDays 90.0)
+          Description = "Archived application builds produced for distribution."
+          Reason = "These contain the dSYM files needed to symbolicate crash reports from released builds. Removing an archive for a version still in the wild makes its crash reports unreadable. Reviewed, never automatic."
+          EstimatedBenefit = "1-20 GB"
+          Examples = [ "~/Library/Developer/Xcode/Archives/2024-01-15" ] }
+
+      { rule "Xcode iOS DeviceSupport" [ MacOS ] (HomeRelative "Library/Developer/Xcode/iOS DeviceSupport") DeveloperArtifacts with
+          Strategy = ContentsOnly
+          Recoverability = Regenerated
+          MinAge = Some (TimeSpan.FromDays 60.0)
+          Description = "Debug symbols cached per connected iOS device and OS version."
+          Reason = "Regenerated when a device running that OS version is next connected. Old iOS versions accumulate indefinitely."
+          EstimatedBenefit = "2-30 GB"
+          Examples = [ "~/Library/Developer/Xcode/iOS DeviceSupport/17.2 (21C62)" ] } |> safe
+
+      { rule "CoreSimulator Caches" [ MacOS ] (HomeRelative "Library/Developer/CoreSimulator/Caches") DeveloperArtifacts with
+          Strategy = ContentsOnly
+          Recoverability = Regenerated
+          Description = "iOS Simulator runtime caches."
+          Reason = "Regenerated by the simulator on next launch."
+          EstimatedBenefit = "500 MB - 5 GB"
+          Examples = [ "~/Library/Developer/CoreSimulator/Caches/dyld" ] } |> safe
+
+      { rule "CoreSimulator Devices" [ MacOS ] (HomeRelative "Library/Developer/CoreSimulator/Devices") DeveloperArtifacts with
+          Risk = Review
+          Recoverability = Unrecoverable
+          Description = "Simulated device containers, including their installed apps and data."
+          Reason = "These hold app state a developer may be mid-test against. Removal is safe in principle but destroys simulator state without warning, so it is surfaced for review rather than deleted."
+          EstimatedBenefit = "1-20 GB"
+          Examples = [ "~/Library/Developer/CoreSimulator/Devices/ABC-123" ] }
+
+      { rule "Container Caches" [ MacOS ] (HomeRelative "Library/Containers") ContainerData with
+          Include = [ "*/Data/Library/Caches/**"; "*/Data/tmp/**" ]
+          Strategy = MatchingFiles
+          Recoverability = Regenerated
+          Description = "Cache and temporary directories inside sandboxed application containers."
+          Reason = "Only these two subpaths within a container are regenerable. Everything else in a container is application state."
+          EstimatedBenefit = "500 MB - 10 GB"
+          Examples = [ "~/Library/Containers/com.apple.Notes/Data/Library/Caches" ] } |> safe
+
+      { rule "Container Data" [ MacOS ] (HomeRelative "Library/Containers") ContainerData with
+          Risk = Review
+          Recoverability = Unrecoverable
+          Description = "All other data inside sandboxed application containers."
+          Reason = "Sandboxed applications store documents, preferences, and databases here. This is user data and is never removed automatically."
+          EstimatedBenefit = "reported only"
+          Examples = [ "~/Library/Containers/com.apple.Notes/Data/Documents" ] }
+
+      { rule "Trash" [ MacOS ] (HomeRelative ".Trash") TrashContents with
+          Risk = Review
+          Recoverability = Unrecoverable
+          Description = "Items already in the Trash."
+          Reason = "This space is not reclaimed until the Trash is emptied. This tool reports the amount but will not empty the Trash, because doing so is the one action that makes its own deletions irreversible."
+          EstimatedBenefit = "reported only"
+          Examples = [ "~/.Trash" ] }
+
+      { rule "Safari Cache" [ MacOS ] (HomeRelative "Library/Caches/com.apple.Safari") BrowserCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Safari's on-disk web cache."
+          Reason = "Re-downloaded as you browse."
+          EstimatedBenefit = "100 MB - 2 GB"
+          Examples = [ "~/Library/Caches/com.apple.Safari/WebKitCache" ] } |> safe
+
+      { rule "Chrome Cache" [ MacOS ] (HomeRelative "Library/Caches/Google/Chrome") BrowserCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Google Chrome's on-disk web cache."
+          Reason = "Re-downloaded as you browse. Does not include profiles, history, or passwords, which live elsewhere."
+          EstimatedBenefit = "200 MB - 3 GB"
+          Examples = [ "~/Library/Caches/Google/Chrome/Default/Cache" ] } |> safe
+
+      { rule "Firefox Cache" [ MacOS ] (HomeRelative "Library/Caches/Firefox") BrowserCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Firefox's on-disk web cache."
+          Reason = "Re-downloaded as you browse."
+          EstimatedBenefit = "100 MB - 2 GB"
+          Examples = [ "~/Library/Caches/Firefox/Profiles" ] } |> safe
+
+      { rule "NuGet Package Cache" [ MacOS; Linux ] (HomeRelative ".nuget/packages") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = ".NET package cache."
+          Reason = "Re-downloaded by `dotnet restore`. Grows without bound across projects and framework versions."
+          EstimatedBenefit = "1-15 GB"
+          Examples = [ "~/.nuget/packages/newtonsoft.json" ] } |> safe
+
+      { rule "Homebrew Cache" [ MacOS ] (HomeRelative "Library/Caches/Homebrew") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Downloaded Homebrew bottles and source archives."
+          Reason = "Re-downloaded on demand. `brew cleanup` does the same thing."
+          EstimatedBenefit = "500 MB - 10 GB"
+          Examples = [ "~/Library/Caches/Homebrew/downloads" ] } |> safe
+
+      { rule "npm Cache" [ MacOS; Linux ] (HomeRelative ".npm/_cacache") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "npm's content-addressable package cache."
+          Reason = "Re-downloaded by `npm install`. Equivalent to `npm cache clean --force`."
+          EstimatedBenefit = "500 MB - 5 GB"
+          Examples = [ "~/.npm/_cacache/content-v2" ] } |> safe
+
+      { rule "pnpm Store" [ MacOS ] (HomeRelative "Library/pnpm/store") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = "pnpm's global content-addressable store."
+          Reason = "Re-downloaded on install. Note that pnpm hard-links from this store into project node_modules, so removing it forces a re-fetch for existing projects too."
+          EstimatedBenefit = "1-10 GB"
+          Examples = [ "~/Library/pnpm/store/v3" ] } |> safe
+
+      { rule "Yarn Cache" [ MacOS; Linux ] (HomeRelative ".yarn/cache") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Yarn's package cache."
+          Reason = "Re-downloaded by `yarn install`."
+          EstimatedBenefit = "200 MB - 3 GB"
+          Examples = [ "~/.yarn/cache" ] } |> safe
+
+      { rule "pip Cache" [ MacOS; Linux ] (HomeRelative "Library/Caches/pip") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Python wheel and HTTP cache."
+          Reason = "Re-downloaded by `pip install`. Equivalent to `pip cache purge`."
+          EstimatedBenefit = "100 MB - 2 GB"
+          Examples = [ "~/Library/Caches/pip/wheels" ] } |> safe
+
+      { rule "Gradle Cache" [ MacOS; Linux ] (HomeRelative ".gradle/caches") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = "Gradle dependency and build cache."
+          Reason = "Re-downloaded and rebuilt on next build."
+          EstimatedBenefit = "1-20 GB"
+          Examples = [ "~/.gradle/caches/modules-2" ] } |> safe
+
+      { rule "Maven Repository" [ MacOS; Linux ] (HomeRelative ".m2/repository") PackageManagerCache with
+          Risk = ProbablySafe
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 60.0)
+          Description = "Maven's local artifact repository."
+          Reason = "Normally re-downloadable, but it can also contain artifacts installed locally via `mvn install` that exist nowhere else. Rated ProbablySafe rather than Safe for that reason."
+          EstimatedBenefit = "1-10 GB"
+          Examples = [ "~/.m2/repository/org/apache" ] }
+
+      { rule "Terraform Plugin Cache" [ MacOS; Linux ] (HomeRelative ".terraform.d/plugin-cache") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Cached Terraform provider binaries."
+          Reason = "Re-downloaded by `terraform init`."
+          EstimatedBenefit = "200 MB - 3 GB"
+          Examples = [ "~/.terraform.d/plugin-cache/registry.terraform.io" ] } |> safe
+
+      { rule "Docker Data" [ MacOS ] (HomeRelative "Library/Containers/com.docker.docker/Data") VirtualMachines with
+          Risk = Review
+          Recoverability = Unrecoverable
+          Description = "Docker Desktop's virtual machine disk image, holding all images, volumes, and containers."
+          Reason = "This is a single large sparse file containing every Docker volume, including databases a developer may depend on. Use `docker system prune` instead, which understands what is safe to remove. Reported, never deleted."
+          EstimatedBenefit = "reported only"
+          Examples = [ "~/Library/Containers/com.docker.docker/Data/vms/0/data" ] }
+
+      { rule "Podman Machine Images" [ MacOS ] (HomeRelative ".local/share/containers/podman") VirtualMachines with
+          Risk = Review
+          Recoverability = Unrecoverable
+          Description = "Podman virtual machine images."
+          Reason = "Contains container volumes and machine state. Use `podman system prune` instead."
+          EstimatedBenefit = "reported only"
+          Examples = [ "~/.local/share/containers/podman/machine" ] }
+
+      { rule "Python Bytecode Caches" [ MacOS; Linux ] (HomeRelative "") DeveloperArtifacts with
+          Include = [ "**/__pycache__/**" ]
+          Strategy = MatchingFiles
+          Recoverability = Regenerated
+          Description = "Compiled Python bytecode."
+          Reason = "Regenerated automatically on next import."
+          EstimatedBenefit = "50-500 MB"
+          Examples = [ "~/Projects/app/__pycache__" ] } |> safe
+
+      { rule "node_modules Directories" [ MacOS; Linux ] (HomeRelative "") DeveloperArtifacts with
+          Include = [ "**/node_modules/**" ]
+          Risk = Review
+          Recoverability = Redownloadable
+          Description = "Installed JavaScript dependencies, per project."
+          Reason = "Reinstallable via the project's lockfile, but only if the project is still wanted and the lockfile is intact. These contain enormous file counts, so they are reported as a single aggregate per project rather than enumerated file by file."
+          EstimatedBenefit = "reported only"
+          Examples = [ "~/Projects/app/node_modules" ] }
+
+      { rule "Old Disk Images" [ MacOS ] (HomeRelative "Downloads") DiskImages with
+          Include = [ "*.dmg"; "*.iso"; "*.pkg" ]
+          Risk = Review
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 60.0)
+          Description = "Installer disk images and packages in Downloads."
+          Reason = "Usually re-downloadable from the vendor, but Downloads is user territory and may hold licensed installers that are no longer available. Reviewed, never automatic."
+          EstimatedBenefit = "1-20 GB"
+          Examples = [ "~/Downloads/Xcode_15.dmg" ] }
+
+      { rule "Old Archives" [ MacOS; Linux ] (HomeRelative "Downloads") Archives with
+          Include = [ "*.zip"; "*.tar"; "*.tar.gz"; "*.tgz"; "*.rar"; "*.7z" ]
+          Risk = Review
+          Recoverability = Unrecoverable
+          MinAge = Some (TimeSpan.FromDays 90.0)
+          Description = "Compressed archives in Downloads."
+          Reason = "Often already extracted and redundant, but the tool cannot tell which. Reviewed, never automatic."
+          EstimatedBenefit = "500 MB - 10 GB"
+          Examples = [ "~/Downloads/project-backup.zip" ] } ]
+
+// ---------------------------------------------------------------------------
+// Linux catalog — seeded
+// ---------------------------------------------------------------------------
+
+let private linuxRules: Rule list =
+    [ { rule "System Temp" [ Linux ] (Absolute "/tmp") TemporaryFiles with
+          Strategy = MatchingFiles
+          Recoverability = Regenerated
+          MinAge = Some (TimeSpan.FromDays 7.0)
+          Description = "System temporary directory."
+          Reason = "Cleared on reboot by most distributions. Files older than a week are abandoned."
+          EstimatedBenefit = "100 MB - 5 GB"
+          Examples = [ "/tmp/build-abc123" ] } |> safe
+
+      { rule "Persistent Temp" [ Linux ] (Absolute "/var/tmp") TemporaryFiles with
+          Risk = Review
+          Recoverability = Unrecoverable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = "Temporary files that survive reboot."
+          Reason = "Unlike /tmp, this is expected to persist, so long-running jobs legitimately keep state here."
+          EstimatedBenefit = "reported only"
+          Examples = [ "/var/tmp/systemd-private-abc" ] }
+
+      { rule "XDG User Cache" [ Linux ] (HomeRelative ".cache") Caches with
+          Strategy = ContentsOnly
+          Recoverability = Regenerated
+          Description = "Per-user application cache directory."
+          Reason = "Applications regenerate these on demand."
+          EstimatedBenefit = "500 MB - 10 GB"
+          Examples = [ "~/.cache/mozilla" ] } |> safe
+
+      { rule "Flatpak Unused Runtimes" [ Linux ] (HomeRelative ".local/share/flatpak") PackageManagerCache with
+          Risk = Review
+          Recoverability = Redownloadable
+          Description = "Installed Flatpak runtimes and applications."
+          Reason = "Use `flatpak uninstall --unused`, which knows which runtimes are still referenced. Reported only."
+          EstimatedBenefit = "reported only"
+          Examples = [ "~/.local/share/flatpak/runtime" ] } ]
+
+// ---------------------------------------------------------------------------
+// Windows catalog — seeded
+// ---------------------------------------------------------------------------
+
+let private windowsRules: Rule list =
+    [ { rule "User Temp" [ Windows ] (EnvRelative("TEMP", "")) TemporaryFiles with
+          Strategy = MatchingFiles
+          Recoverability = Regenerated
+          MinAge = Some (TimeSpan.FromDays 7.0)
+          Description = "Per-user temporary directory."
+          Reason = "Abandoned by the applications that created them."
+          EstimatedBenefit = "500 MB - 5 GB"
+          Examples = [ "%TEMP%\\nsy1234.tmp" ] } |> safe
+
+      { rule "Windows Update Cache" [ Windows ] (Absolute "C:\\Windows\\SoftwareDistribution\\Download") Caches with
+          Risk = ProbablySafe
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = "Downloaded Windows Update payloads."
+          Reason = "Re-downloaded if needed, but removing them mid-update interrupts a pending install."
+          EstimatedBenefit = "500 MB - 8 GB"
+          Examples = [ "C:\\Windows\\SoftwareDistribution\\Download" ] }
+
+      { rule "NuGet Package Cache (Windows)" [ Windows ] (EnvRelative("USERPROFILE", ".nuget\\packages")) PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = ".NET package cache."
+          Reason = "Re-downloaded by `dotnet restore`."
+          EstimatedBenefit = "1-15 GB"
+          Examples = [ "%USERPROFILE%\\.nuget\\packages" ] } |> safe
+
+      { rule "Recycle Bin" [ Windows ] (Absolute "C:\\$Recycle.Bin") TrashContents with
+          Risk = Review
+          Recoverability = Unrecoverable
+          Description = "Items already in the Recycle Bin."
+          Reason = "This space is not reclaimed until the Recycle Bin is emptied, which this tool will not do."
+          EstimatedBenefit = "reported only"
+          Examples = [ "C:\\$Recycle.Bin" ] } ]
+
+/// Every rule across every platform.
+let catalog: Rule list = macOsRules @ linuxRules @ windowsRules
+
+/// Rules applicable to a given platform.
+let forPlatform (platform: Types.Platform) : Rule list =
+    catalog |> List.filter (fun r -> r.Platforms.Contains platform)
+
+/// Orders rules most-specific-first: longer resolved roots win, then
+/// declaration order. This is what lets a narrow rule inside a broad one
+/// take precedence — the Containers cache rule over the Containers catch-all.
+let byPrecedence (rules: ResolvedRule list) : ResolvedRule list =
+    rules |> List.sortBy (fun r -> -r.Root.Length)
+
+/// Resolves every applicable rule against this machine, dropping those whose
+/// root does not exist. A missing root simply means the tool that creates it
+/// is not installed.
+let resolveAll (fs: Platform.FileSystemOps) (platform: Types.Platform) : ResolvedRule list =
+    forPlatform platform
+    |> List.choose (fun r ->
+        match Platform.resolve r.Root with
+        | Some root when fs.Exists root -> Some { Rule = r; Root = root }
+        | _ -> None)
+    |> byPrecedence
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: PASS — 58 tests total.
+
+- [ ] **Step 6: Inspect which rules resolve on this machine**
+
+```bash
+cat > /tmp/ruleprobe.fsx <<'EOF'
+#load "src/Rules.fsx"
+let fs = Platform.FileSystem.real
+let resolved = Rules.resolveAll fs (Platform.current ())
+printfn "%d of %d rules resolved on this machine:" resolved.Length (Rules.forPlatform (Platform.current ())).Length
+for r in resolved do printfn "  %-32s %s" r.Rule.Name r.Root
+EOF
+dotnet fsi /tmp/ruleprobe.fsx && rm /tmp/ruleprobe.fsx
+```
+
+Expected: a list of rules whose roots exist. On a machine with Xcode and .NET installed, `Xcode DerivedData` and `NuGet Package Cache` should appear. Rules for uninstalled tooling are correctly absent. Confirm the roots printed are the ones you expect before proceeding — this is the last checkpoint before the risk engine consumes them.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/Rules.fsx tests/TestRules.fsx tests/Tests.fsx
+git commit -m "feat: add rule catalog with macOS complete, Linux/Windows seeded
+
+Rules are pure data; the scanner is parameterized over the list and
+contains no rule-specific logic, so adding a rule is appending a
+record. The safe helper sets Risk and SafeToDelete together so the
+pair cannot drift. Precedence is longest-root-first, which is what
+lets the Containers cache rule outrank the Containers catch-all."
+```
+
+---
+
+### Task 8: RiskEngine — the safety core
+
+**This is the most important task in the plan.** Everything else is reporting. This task decides what may be destroyed.
+
+**Files:**
+- Create: `src/RiskEngine.fsx`
+- Create: `tests/TestRiskEngine.fsx`
+- Modify: `tests/Tests.fsx`
+
+**Interfaces:**
+- Consumes: `Types`, `Utilities`, `Platform`, `Rules`, `Configuration`
+- Produces:
+  - `RiskEngine.denylist : unit -> string list`
+  - `RiskEngine.isVetoed : string -> bool`
+  - `RiskEngine.applyOverrides : Map<string, RiskLevel> -> Rule -> Result<Rule, string>`
+  - `RiskEngine.DeletionCandidate` (**private constructor**)
+  - `RiskEngine.candidatePath : DeletionCandidate -> string`
+  - `RiskEngine.candidateSize : DeletionCandidate -> int64`
+  - `RiskEngine.candidateRule : DeletionCandidate -> string`
+  - `RiskEngine.Rejection` = `NotSafeToDelete | RiskTooHigh of RiskLevel | OutsideRuleRoot | Vetoed of string | IsSymlink`
+  - `RiskEngine.evaluate : allowProbablySafe: bool -> ResolvedRule -> FileMeta -> Result<DeletionCandidate, Rejection>`
+
+- [ ] **Step 1: Write the adversarial gate tests**
+
+Create `tests/TestRiskEngine.fsx`. These tests are the safety guarantee — write them before any implementation.
+
+```fsharp
+#load "TestFramework.fsx"
+#load "../src/RiskEngine.fsx"
+open System
+open TestFramework
+open Types
+open Rules
+open RiskEngine
+
+/// Builds a FileMeta for a path with sensible defaults.
+let private meta path size =
+    { Path = path
+      SizeBytes = size
+      LastAccess = DateTime.UtcNow.AddDays -10.0
+      LastModified = DateTime.UtcNow.AddDays -10.0
+      Created = DateTime.UtcNow.AddDays -100.0
+      IsDirectory = false
+      LinkTarget = None
+      Owner = "testuser"
+      Mode = "rw-r--r--" }
+
+/// A Safe, deletable rule rooted at /testroot.
+let private safeRule =
+    { Rule =
+        { Name = "Test Safe Rule"
+          Platforms = Set.ofList [ MacOS; Linux; Windows ]
+          Root = Absolute "/testroot"
+          Include = []
+          Exclude = []
+          Risk = Safe
+          Recoverability = Regenerated
+          Strategy = ContentsOnly
+          MinAge = None
+          MinSize = None
+          SafeToDelete = true
+          Description = "test"
+          Reason = "test"
+          EstimatedBenefit = "test"
+          Examples = [ "/testroot/x" ]
+          Category = Caches }
+      Root = "/testroot" }
+
+let run () =
+    suite "RiskEngine gate 1 — rule assertion"
+
+    test "a Safe rule with SafeToDelete produces a candidate" (fun () ->
+        let c = assertOk (evaluate false safeRule (meta "/testroot/file.tmp" 100L)) "safe rule accepts"
+        assertEqual "/testroot/file.tmp" (candidatePath c) "path preserved"
+        assertEqual 100L (candidateSize c) "size preserved")
+
+    test "a rule without SafeToDelete is rejected" (fun () ->
+        let rule = { safeRule with Rule = { safeRule.Rule with SafeToDelete = false } }
+        assertEqual NotSafeToDelete (assertError (evaluate false rule (meta "/testroot/f" 1L)) "rejected") "NotSafeToDelete")
+
+    test "a Review rule is rejected even when SafeToDelete is set" (fun () ->
+        // Defence in depth: the catalog test forbids this combination, but the
+        // engine must not trust that a malformed rule cannot reach it.
+        let rule = { safeRule with Rule = { safeRule.Rule with Risk = Review } }
+        assertEqual (RiskTooHigh Review) (assertError (evaluate false rule (meta "/testroot/f" 1L)) "rejected") "RiskTooHigh")
+
+    test "ProbablySafe is rejected by default and accepted only with the flag" (fun () ->
+        let rule = { safeRule with Rule = { safeRule.Rule with Risk = ProbablySafe } }
+        assertEqual (RiskTooHigh ProbablySafe)
+            (assertError (evaluate false rule (meta "/testroot/f" 1L)) "rejected without flag") "rejected by default"
+        assertOk (evaluate true rule (meta "/testroot/f" 1L)) "accepted with allowProbablySafe" |> ignore)
+
+    test "Dangerous and NeverDelete are rejected even with the force flag" (fun () ->
+        for level in [ Dangerous; NeverDelete ] do
+            let rule = { safeRule with Rule = { safeRule.Rule with Risk = level } }
+            assertEqual (RiskTooHigh level)
+                (assertError (evaluate true rule (meta "/testroot/f" 1L)) "rejected")
+                (sprintf "%A is never deletable" level))
+
+    suite "RiskEngine gate 2 — allowlist anchoring"
+
+    test "a path outside the rule root is rejected" (fun () ->
+        assertEqual OutsideRuleRoot
+            (assertError (evaluate false safeRule (meta "/elsewhere/file" 1L)) "outside root") "OutsideRuleRoot")
+
+    test "the rule root itself is not a candidate" (fun () ->
+        // Deleting the root would remove the very directory the rule describes.
+        assertEqual OutsideRuleRoot
+            (assertError (evaluate false safeRule (meta "/testroot" 1L)) "root itself") "root is not its own descendant")
+
+    test "a traversal escape from inside the root is rejected" (fun () ->
+        // The attack: a path that textually starts with the root but resolves outside it.
+        assertEqual OutsideRuleRoot
+            (assertError (evaluate false safeRule (meta "/testroot/../etc/passwd" 1L)) "escape rejected")
+            "dot-dot escape rejected")
+
+    test "a deeper traversal escape is rejected" (fun () ->
+        assertEqual OutsideRuleRoot
+            (assertError (evaluate false safeRule (meta "/testroot/a/b/../../../etc/passwd" 1L)) "deep escape")
+            "multi-level escape rejected")
+
+    test "a sibling directory sharing a name prefix is rejected" (fun () ->
+        // /testroot-backup must not be treated as inside /testroot.
+        assertEqual OutsideRuleRoot
+            (assertError (evaluate false safeRule (meta "/testroot-backup/file" 1L)) "prefix collision")
+            "prefix collision rejected")
+
+    test "dot-dot that stays inside the root is accepted" (fun () ->
+        assertOk (evaluate false safeRule (meta "/testroot/a/../b" 1L)) "inner dot-dot resolves inside" |> ignore)
+
+    suite "RiskEngine gate 3 — denylist veto"
+
+    test "protected user directories are vetoed" (fun () ->
+        let home = Platform.home ()
+        for folder in [ "Documents"; "Desktop"; "Pictures"; "Movies"; "Music" ] do
+            let path = IO.Path.Combine(home, folder, "file.txt")
+            assertTrue (isVetoed path) (sprintf "%s is vetoed" folder))
+
+    test "system directories are vetoed" (fun () ->
+        assertTrue (isVetoed "/System/Library/anything") "/System vetoed"
+        assertTrue (isVetoed "/Applications/Xcode.app") "/Applications vetoed")
+
+    test "any path inside a git repository is vetoed" (fun () ->
+        // Deleting from inside .git can destroy unpushed commits.
+        assertTrue (isVetoed "/anywhere/project/.git/objects/ab/cdef") ".git contents vetoed"
+        assertTrue (isVetoed "/anywhere/project/.git") ".git itself vetoed")
+
+    test "the veto overrides a Safe rule that would otherwise accept" (fun () ->
+        // The critical case: a rule root that overlaps protected territory.
+        let home = Platform.home ()
+        let rule = { safeRule with
+                       Rule = { safeRule.Rule with Root = Absolute home }
+                       Root = home }
+        let protectedPath = IO.Path.Combine(home, "Documents", "thesis.txt")
+        match evaluate false rule (meta protectedPath 1L) with
+        | Error (Vetoed _) -> ()
+        | Error other -> assertTrue false (sprintf "expected Vetoed, got %A" other)
+        | Ok _ -> assertTrue false "VETO FAILED — a protected path produced a candidate")
+
+    test "the veto is not bypassed by the force flag" (fun () ->
+        let home = Platform.home ()
+        let rule = { safeRule with
+                       Rule = { safeRule.Rule with Root = Absolute home }
+                       Root = home }
+        let protectedPath = IO.Path.Combine(home, "Desktop", "notes.txt")
+        match evaluate true rule (meta protectedPath 1L) with
+        | Error (Vetoed _) -> ()
+        | _ -> assertTrue false "VETO FAILED — force bypassed the denylist")
+
+    test "an ordinary path under a rule root is not vetoed" (fun () ->
+        assertFalse (isVetoed "/testroot/cache/entry") "ordinary cache path allowed")
+
+    suite "RiskEngine — symlinks"
+
+    test "a symlink is never a candidate" (fun () ->
+        // Following a link could relocate the target rather than the link.
+        let link = { meta "/testroot/link" 0L with LinkTarget = Some "/elsewhere/real" }
+        assertEqual IsSymlink (assertError (evaluate false safeRule link) "symlink rejected") "IsSymlink")
+
+    suite "RiskEngine — override clamping"
+
+    test "an override that raises risk is applied" (fun () ->
+        let overrides = Map.ofList [ "Test Safe Rule", Review ]
+        let updated = assertOk (applyOverrides overrides safeRule.Rule) "raising override applied"
+        assertEqual Review updated.Risk "risk raised"
+        assertFalse updated.SafeToDelete "raising risk also clears SafeToDelete")
+
+    test "an override that lowers risk is an error, not a silent clamp" (fun () ->
+        // Silently ignoring it would leave the user believing they had
+        // loosened a restriction that in fact still applies.
+        let reviewRule = { safeRule.Rule with Name = "Review Rule"; Risk = Review; SafeToDelete = false }
+        let overrides = Map.ofList [ "Review Rule", Safe ]
+        let message = assertError (applyOverrides overrides reviewRule) "lowering rejected"
+        assertContains "Review Rule" message "names the rule"
+        assertContains "lower" (message.ToLowerInvariant()) "explains the direction")
+
+    test "an override naming an unknown rule is ignored without error" (fun () ->
+        let overrides = Map.ofList [ "No Such Rule", Review ]
+        let updated = assertOk (applyOverrides overrides safeRule.Rule) "unrelated override ignored"
+        assertEqual Safe updated.Risk "unchanged")
+
+    test "an override to the same level is accepted as a no-op" (fun () ->
+        let overrides = Map.ofList [ "Test Safe Rule", Safe ]
+        let updated = assertOk (applyOverrides overrides safeRule.Rule) "same level accepted"
+        assertEqual Safe updated.Risk "unchanged")
+```
+
+- [ ] **Step 2: Wire into the test entry point**
+
+Modify `tests/Tests.fsx` — add `#load "TestRiskEngine.fsx"` and `TestRiskEngine.run ()`.
+
+- [ ] **Step 3: Run the tests to verify they fail**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: FAIL — cannot find `../src/RiskEngine.fsx`.
+
+- [ ] **Step 4: Write RiskEngine.fsx**
+
+Create `src/RiskEngine.fsx`:
+
+```fsharp
+(**
+    The safety core. Three independent gates decide whether anything may be
+    removed. Each gate can only reject; none can approve on its own, and all
+    three must pass.
+
+      Gate 1  Rule assertion    — a matched rule must be Safe and SafeToDelete
+      Gate 2  Allowlist anchor  — the path must be a strict descendant of the
+                                  rule's resolved root, after normalization
+      Gate 3  Denylist veto     — a hardcoded protected set, checked last
+
+    The veto outranks --force and outranks configuration overrides. It has no
+    bypass flag. Configuration overrides may only raise severity; an override
+    that lowers it is a validation error rather than a silent clamp, because
+    silently ignoring it would leave the user believing a restriction had been
+    loosened when it had not.
+
+    `DeletionCandidate` has a private constructor. The only way to obtain one
+    is `evaluate`, so no caller anywhere in the codebase can hand the Cleaner
+    an arbitrary path. "Delete /" is unreachable by construction rather than
+    defended against at runtime.
+*)
+module RiskEngine
+
+open System
+
+#load "Types.fsx"
+#load "Utilities.fsx"
+#load "Platform.fsx"
+#load "Rules.fsx"
+open Types
+open Utilities
+open Rules
+
+/// Why a path was refused. Every rejection is explicit and reportable.
+type Rejection =
+    /// The matched rule does not assert deletability.
+    | NotSafeToDelete
+    /// The rule's risk level exceeds what the current flags permit.
+    | RiskTooHigh of RiskLevel
+    /// The path is not a strict descendant of the rule's resolved root.
+    | OutsideRuleRoot
+    /// The path is inside a protected location. Names the protected ancestor.
+    | Vetoed of string
+    /// The path is a symlink; relocating it would move the link, not the target.
+    | IsSymlink
+
+module Rejection =
+    /// A human-readable explanation for reports.
+    let toText (r: Rejection) : string =
+        match r with
+        | NotSafeToDelete -> "the matching rule does not permit deletion"
+        | RiskTooHigh level -> sprintf "risk level %s exceeds what the current flags allow" (RiskLevel.toText level)
+        | OutsideRuleRoot -> "the path is not inside the rule's root directory"
+        | Vetoed ancestor -> sprintf "the path is inside the protected location %s" ancestor
+        | IsSymlink -> "the path is a symbolic link"
+
+/// Paths that are never deletable, regardless of rules, flags, or config.
+///
+/// Returned as a function rather than a value because the home-relative
+/// entries must resolve against the invoking user at call time.
+let denylist () : string list =
+    let home = Platform.home ()
+    let underHome relative = IO.Path.Combine(home, relative)
+    [ underHome "Documents"
+      underHome "Desktop"
+      underHome "Pictures"
+      underHome "Movies"
+      underHome "Music"
+      underHome "Downloads"
+      underHome "Library/Application Support"
+      "/System"
+      "/Library"
+      "/Applications"
+      "/usr"
+      "/bin"
+      "/sbin"
+      "/etc"
+      "/var/db" ]
+    |> List.map Utilities.Path.normalize
+
+/// Cache-safe subpaths that are exempt from the Application Support veto.
+/// These are the only locations inside a protected directory that a rule may
+/// legitimately target.
+let private vetoExemptions () : string list =
+    let home = Platform.home ()
+    [ IO.Path.Combine(home, "Library/Application Support/CrashReporter") ]
+    |> List.map Utilities.Path.normalize
+
+/// True when a path is protected and must never be removed.
+///
+/// A path is vetoed when it is, or is inside, any denylist entry — unless it
+/// is inside a narrower exemption. Additionally, any path inside a `.git`
+/// directory is vetoed unconditionally: removing objects there can destroy
+/// commits that exist nowhere else.
+let isVetoed (path: string) : bool =
+    let normalized = Utilities.Path.normalize path
+
+    let inGitDirectory =
+        Utilities.Path.segments normalized
+        |> List.exists (fun segment -> segment = ".git")
+
+    if inGitDirectory then true
+    else
+        let exempt =
+            vetoExemptions ()
+            |> List.exists (fun e ->
+                Utilities.Path.equals e normalized || Utilities.Path.isDescendantOf e normalized)
+        if exempt then false
+        else
+            denylist ()
+            |> List.exists (fun protectedPath ->
+                Utilities.Path.equals protectedPath normalized
+                || Utilities.Path.isDescendantOf protectedPath normalized)
+
+/// The protected ancestor responsible for a veto, for error reporting.
+let private vetoingAncestor (path: string) : string =
+    let normalized = Utilities.Path.normalize path
+    if Utilities.Path.segments normalized |> List.exists (fun s -> s = ".git") then ".git"
+    else
+        denylist ()
+        |> List.tryFind (fun p ->
+            Utilities.Path.equals p normalized || Utilities.Path.isDescendantOf p normalized)
+        |> Option.defaultValue "(protected)"
+
+/// Applies a configuration risk override to a rule.
+///
+/// An override may only raise severity. Lowering is rejected with an
+/// explanatory error rather than silently ignored. Raising risk also clears
+/// `SafeToDelete`, so the two fields cannot drift out of agreement.
+let applyOverrides (overrides: Map<string, RiskLevel>) (rule: Rule) : Result<Rule, string> =
+    match overrides.TryFind rule.Name with
+    | None -> Ok rule
+    | Some requested ->
+        let currentSeverity = RiskLevel.severity rule.Risk
+        let requestedSeverity = RiskLevel.severity requested
+        if requestedSeverity < currentSeverity then
+            Error (
+                sprintf
+                    "riskOverrides cannot lower risk: rule '%s' is declared %s and the override requests %s. Overrides may only raise severity."
+                    rule.Name (RiskLevel.toText rule.Risk) (RiskLevel.toText requested))
+        elif requestedSeverity = currentSeverity then Ok rule
+        else Ok { rule with Risk = requested; SafeToDelete = false }
+
+/// A path that has passed all three gates and may be moved to Trash.
+///
+/// The constructor is private to this module. `evaluate` is the only way to
+/// produce one, which is what makes an arbitrary path structurally incapable
+/// of reaching the Cleaner.
+type DeletionCandidate =
+    private
+        { Path: string
+          RuleName: string
+          Strategy: DeleteStrategy
+          SizeBytes: int64 }
+
+/// The path this candidate refers to.
+let candidatePath (c: DeletionCandidate) : string = c.Path
+
+/// The size in bytes of this candidate.
+let candidateSize (c: DeletionCandidate) : int64 = c.SizeBytes
+
+/// The name of the rule that produced this candidate.
+let candidateRule (c: DeletionCandidate) : string = c.RuleName
+
+/// The removal strategy declared by the producing rule.
+let candidateStrategy (c: DeletionCandidate) : DeleteStrategy = c.Strategy
+
+/// Runs all three gates against a file under a resolved rule.
+///
+/// `allowProbablySafe` corresponds to the --force flag. It widens gate 1 by
+/// exactly one level and has no effect on gates 2 or 3.
+let evaluate
+    (allowProbablySafe: bool)
+    (resolved: ResolvedRule)
+    (file: FileMeta)
+    : Result<DeletionCandidate, Rejection> =
+
+    let rule = resolved.Rule
+
+    // A symlink is refused before any gate: relocating it would move the link
+    // rather than its target, which is never what the user asked for.
+    if file.LinkTarget.IsSome then Error IsSymlink
+
+    // Gate 1 — the rule must assert deletability at a permitted risk level.
+    elif not rule.SafeToDelete then Error NotSafeToDelete
+    else
+        let permitted =
+            match rule.Risk with
+            | Safe -> true
+            | ProbablySafe -> allowProbablySafe
+            | Review | Dangerous | NeverDelete -> false
+
+        if not permitted then Error (RiskTooHigh rule.Risk)
+
+        // Gate 2 — the path must resolve to a strict descendant of the rule
+        // root. isDescendantOf normalizes both operands first, so a traversal
+        // escape is resolved before comparison rather than string-matched.
+        elif not (Utilities.Path.isDescendantOf resolved.Root file.Path) then Error OutsideRuleRoot
+
+        // Gate 3 — the veto, checked last so it overrides everything above.
+        elif isVetoed file.Path then Error (Vetoed(vetoingAncestor file.Path))
+
+        else
+            Ok { Path = Utilities.Path.normalize file.Path
+                 RuleName = rule.Name
+                 Strategy = rule.Strategy
+                 SizeBytes = file.SizeBytes }
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `dotnet fsi tests/Tests.fsx`
+
+Expected: PASS — 79 tests total.
+
+Every one of the 21 RiskEngine tests must pass. **If any gate test fails, stop and fix it before proceeding to any later task.** A failing gate test means the tool can destroy data.
+
+- [ ] **Step 6: Verify the private constructor actually blocks external construction**
+
+This confirms the structural guarantee rather than trusting it. Create `/tmp/ctorprobe.fsx`:
+
+```fsharp
+#load "src/RiskEngine.fsx"
+open RiskEngine
+// This must NOT compile. If it does, the structural guarantee is broken.
+let forged = { Path = "/"; RuleName = "forged"; Strategy = Types.WholeDirectory; SizeBytes = 0L }
+printfn "%A" forged
+```
+
+Run: `dotnet fsi /tmp/ctorprobe.fsx`
+
+Expected: **a compile error**, specifically `FS1093: The union cases or fields of the type 'DeletionCandidate' are not accessible from this code location`.
+
+If this file compiles and prints, the `private` modifier is not doing its job and must be fixed before continuing.
+
+Clean up: `rm /tmp/ctorprobe.fsx`
+
+- [ ] **Step 7: Verify the veto against the real home directory**
+
+```bash
+cat > /tmp/vetoprobe.fsx <<'EOF'
+#load "src/RiskEngine.fsx"
+let home = Platform.home ()
+let cases =
+    [ IO.Path.Combine(home, "Documents/thesis.txt"), true
+      IO.Path.Combine(home, "Desktop/notes.txt"), true
+      IO.Path.Combine(home, "Library/Caches/com.apple.Safari/x"), false
+      IO.Path.Combine(home, "Projects/app/.git/objects/ab/cd"), true
+      "/System/Library/x", true
+      "/tmp/scratch", false ]
+let mutable failures = 0
+for path, expected in cases do
+    let actual = RiskEngine.isVetoed path
+    if actual <> expected then
+        failures <- failures + 1
+        printfn "FAIL %s expected vetoed=%b got %b" path expected actual
+    else printfn "ok   vetoed=%-5b %s" actual path
+exit failures
+EOF
+dotnet fsi /tmp/vetoprobe.fsx; echo "exit=$?"; rm /tmp/vetoprobe.fsx
+```
+
+Expected: all six `ok` lines and `exit=0`.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/RiskEngine.fsx tests/TestRiskEngine.fsx tests/Tests.fsx
+git commit -m "feat: add three-gate risk engine
+
+Gate 1 requires a Safe rule asserting deletability; gate 2 requires
+strict descent from the rule root after normalization, which rejects
+traversal escapes and prefix collisions; gate 3 is a denylist veto
+that outranks --force and config overrides and has no bypass.
+
+DeletionCandidate has a private constructor, so evaluate is the only
+way to produce one and no caller can hand the Cleaner an arbitrary
+path. Overrides may only raise severity; lowering is an error rather
+than a silent clamp."
+```
+
+---
+
+**Remaining tasks (9–17) follow in the next section of this plan.**
