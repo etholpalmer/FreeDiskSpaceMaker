@@ -7,7 +7,7 @@ open Types
 open Platform
 
 let private entry path size days =
-    { Path = path; SizeBytes = size; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = days }
+    { Path = path; SizeBytes = size; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = days; ApparentBytes = None }
 
 let private metaOf (fs: FileSystemOps) path =
     match fs.GetInfo path with

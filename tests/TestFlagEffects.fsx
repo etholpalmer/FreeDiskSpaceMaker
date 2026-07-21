@@ -43,11 +43,11 @@ let private fixtureRule : ResolvedRule =
 /// Two small recent files, one large old file, plus a byte-identical twin of
 /// the large one so duplicate detection has something real to find.
 let private tree =
-    [ { Path = "/fx"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-      { Path = "/fx/new-small-a.tmp"; SizeBytes = 2_000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-      { Path = "/fx/new-small-b.tmp"; SizeBytes = 2_000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-      { Path = "/fx/old-large-a.tmp"; SizeBytes = 8_000_000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 400.0 }
-      { Path = "/fx/old-large-b.tmp"; SizeBytes = 8_000_000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 400.0 } ]
+    [ { Path = "/fx"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+      { Path = "/fx/new-small-a.tmp"; SizeBytes = 2_000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+      { Path = "/fx/new-small-b.tmp"; SizeBytes = 2_000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+      { Path = "/fx/old-large-a.tmp"; SizeBytes = 8_000_000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 400.0; ApparentBytes = None }
+      { Path = "/fx/old-large-b.tmp"; SizeBytes = 8_000_000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 400.0; ApparentBytes = None } ]
 
 let private fs = FileSystem.inMemory tree
 

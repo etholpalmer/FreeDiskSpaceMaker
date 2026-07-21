@@ -8,15 +8,15 @@ open Platform
 open DirectoryWalker
 
 let private tree =
-    [ { Path = "/root"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-      { Path = "/root/a.log"; SizeBytes = 100L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
-      { Path = "/root/sub"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-      { Path = "/root/sub/b.log"; SizeBytes = 200L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
-      { Path = "/root/sub/deep"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-      { Path = "/root/sub/deep/c.log"; SizeBytes = 300L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
-      { Path = "/root/ignored"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-      { Path = "/root/ignored/d.log"; SizeBytes = 400L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
-      { Path = "/root/link"; SizeBytes = 0L; IsDirectory = true; LinkTarget = Some "/elsewhere"; ModifiedDaysAgo = 1.0 } ]
+    [ { Path = "/root"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+      { Path = "/root/a.log"; SizeBytes = 100L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0; ApparentBytes = None }
+      { Path = "/root/sub"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+      { Path = "/root/sub/b.log"; SizeBytes = 200L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0; ApparentBytes = None }
+      { Path = "/root/sub/deep"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+      { Path = "/root/sub/deep/c.log"; SizeBytes = 300L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0; ApparentBytes = None }
+      { Path = "/root/ignored"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+      { Path = "/root/ignored/d.log"; SizeBytes = 400L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0; ApparentBytes = None }
+      { Path = "/root/link"; SizeBytes = 0L; IsDirectory = true; LinkTarget = Some "/elsewhere"; ModifiedDaysAgo = 1.0; ApparentBytes = None } ]
 
 let run () =
     suite "DirectoryWalker"

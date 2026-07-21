@@ -50,6 +50,7 @@ let run () =
         let resolved : Rules.ResolvedRule = { Rule = rule; Root = "/derived" }
         let child =
             { Path = "/derived/build/x.o"; SizeBytes = 10L
+              ApparentBytes = 10L
               LastAccess = DateTime.UtcNow; LastModified = DateTime.UtcNow
               Created = DateTime.UtcNow; IsDirectory = false
               LinkTarget = None; Owner = "u"; Mode = "rw-r--r--" }

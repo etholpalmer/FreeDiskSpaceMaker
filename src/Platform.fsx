@@ -103,7 +103,11 @@ type TreeEntry =
       IsDirectory: bool
       LinkTarget: string option
       /// How long ago the entry was last modified, so age rules are testable.
-      ModifiedDaysAgo: float }
+      ModifiedDaysAgo: float
+      /// Apparent length when it differs from allocation, so sparse-file
+      /// handling is testable without creating a real sparse file.
+      /// None means the entry is not sparse.
+      ApparentBytes: int64 option }
 
 module FileSystem =
 
@@ -148,6 +152,47 @@ module FileSystem =
             ReturnSpecialDirectories = false,
             AttributesToSkip = FileAttributes.None)
 
+    /// Files at or above this apparent size are measured for real allocation.
+    ///
+    /// Measuring costs a `stat` process spawn — about 4 ms — so it is not worth
+    /// doing per file across a 200k-file scan. Sparseness only misleads when
+    /// the gap is large, and a gap that matters implies a large file, so a size
+    /// floor is the right filter. Extension is not: measured on macOS, `.raw`
+    /// images were sparse while `.qcow2`, `.hds` and `.iso` files were not, so
+    /// the filename predicts nothing.
+    let sparseProbeThresholdBytes = 1_073_741_824L // 1 GiB
+
+    /// Bytes actually allocated to a file, or None when it cannot be measured.
+    ///
+    /// .NET exposes no allocated-size API — `FileInfo.Length` is the logical
+    /// extent — so this shells out to `stat`, which reports 512-byte blocks.
+    /// Returns None on Windows, when `stat` is absent, or on any failure, and
+    /// callers then fall back to the apparent size. Being wrong here must
+    /// degrade to today's behaviour, never to an error.
+    let allocatedBytes (path: string) : int64 option =
+        let arguments =
+            match current () with
+            | MacOS -> Some [| "-f"; "%b"; path |]
+            | Linux -> Some [| "-c"; "%b"; path |]
+            | Windows -> None // NTFS sparse queries need P/Invoke; out of scope.
+
+        match arguments with
+        | None -> None
+        | Some args ->
+            try
+                let startInfo = Diagnostics.ProcessStartInfo(FileName = "stat", RedirectStandardOutput = true,
+                                                             RedirectStandardError = true, UseShellExecute = false)
+                for a in args do startInfo.ArgumentList.Add a
+                use process' = Diagnostics.Process.Start startInfo
+                let output = process'.StandardOutput.ReadToEnd()
+                process'.WaitForExit()
+                if process'.ExitCode <> 0 then None
+                else
+                    match Int64.TryParse(output.Trim()) with
+                    | true, blocks when blocks >= 0L -> Some (blocks * 512L)
+                    | _ -> None
+            with _ -> None
+
     /// The real filesystem.
     let real: FileSystemOps =
         { EnumerateDirectories = fun path ->
@@ -166,16 +211,23 @@ module FileSystem =
                     let info: FileSystemInfo =
                         if isDirectory then DirectoryInfo path :> FileSystemInfo
                         else FileInfo path :> FileSystemInfo
-                    let size =
+                    let apparent =
                         match info with
                         | :? FileInfo as f -> f.Length
                         | _ -> 0L
+                    // Only large files are measured; see sparseProbeThresholdBytes.
+                    // A failed measurement falls back to the apparent size, so
+                    // this can only improve accuracy, never break the scan.
+                    let size =
+                        if isDirectory || apparent < sparseProbeThresholdBytes then apparent
+                        else allocatedBytes path |> Option.defaultValue apparent
                     let mode =
                         if current () = Windows then ""
                         else
                             try string (File.GetUnixFileMode path) with _ -> ""
                     Ok { Path = path
                          SizeBytes = size
+                         ApparentBytes = apparent
                          LastAccess = info.LastAccessTimeUtc
                          LastModified = info.LastWriteTimeUtc
                          Created = info.CreationTimeUtc
@@ -211,6 +263,7 @@ module FileSystem =
             let modified = now.AddDays(-e.ModifiedDaysAgo)
             { Path = e.Path
               SizeBytes = e.SizeBytes
+              ApparentBytes = defaultArg e.ApparentBytes e.SizeBytes
               LastAccess = modified
               LastModified = modified
               Created = modified

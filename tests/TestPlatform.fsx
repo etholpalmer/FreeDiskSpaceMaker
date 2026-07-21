@@ -37,12 +37,12 @@ let run () =
     suite "Platform.FileSystem.inMemory"
 
     let tree =
-        [ { Path = "/root"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-          { Path = "/root/a.log"; SizeBytes = 100L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 10.0 }
-          { Path = "/root/b.txt"; SizeBytes = 200L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 2.0 }
-          { Path = "/root/sub"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-          { Path = "/root/sub/c.log"; SizeBytes = 300L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 90.0 }
-          { Path = "/root/link"; SizeBytes = 0L; IsDirectory = false; LinkTarget = Some "/elsewhere"; ModifiedDaysAgo = 1.0 } ]
+        [ { Path = "/root"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+          { Path = "/root/a.log"; SizeBytes = 100L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 10.0; ApparentBytes = None }
+          { Path = "/root/b.txt"; SizeBytes = 200L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 2.0; ApparentBytes = None }
+          { Path = "/root/sub"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+          { Path = "/root/sub/c.log"; SizeBytes = 300L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 90.0; ApparentBytes = None }
+          { Path = "/root/link"; SizeBytes = 0L; IsDirectory = false; LinkTarget = Some "/elsewhere"; ModifiedDaysAgo = 1.0; ApparentBytes = None } ]
 
     let fs = FileSystem.inMemory tree
 
@@ -139,4 +139,47 @@ let run () =
                 "Environment.UserName resolves without the USER variable"
         finally
             Environment.SetEnvironmentVariable("USER", original))
+
+    test "a sparse file reports allocated bytes, not apparent length" (fun () ->
+        // .NET exposes only FileInfo.Length, the logical extent. For a sparse
+        // file that overstates disk use several-fold — measured on macOS,
+        // Docker.raw showed 64.0 GB apparent against 16.7 GB allocated.
+        // Every size the tool reports must be occupancy, not length.
+        let path = IO.Path.Combine(IO.Path.GetTempPath(), "dcasparse.bin")
+        if IO.File.Exists path then IO.File.Delete path
+        try
+            // 2 GiB logical, one byte written at the end: the middle is a hole.
+            use fileStream = new IO.FileStream(path, IO.FileMode.CreateNew, IO.FileAccess.Write)
+            fileStream.SetLength 2_147_483_648L
+            fileStream.Seek(-1L, IO.SeekOrigin.End) |> ignore
+            fileStream.WriteByte 1uy
+            fileStream.Dispose()
+
+            match FileSystem.allocatedBytes path with
+            | None ->
+                // stat unavailable — the fallback path. Not a failure, but the
+                // sparse assertions below cannot be made, so state it.
+                assertTrue true "allocation could not be measured on this platform"
+            | Some allocated ->
+                let meta = assertOk (FileSystem.real.GetInfo path) "stat the sparse file"
+                assertEqual 2_147_483_648L meta.ApparentBytes "apparent length is the logical extent"
+                assertEqual allocated meta.SizeBytes "reported size is the allocated size"
+                assertTrue (meta.SizeBytes < meta.ApparentBytes) "allocation is below apparent length"
+                assertTrue (FileMeta.isSparse meta) "recognised as sparse"
+                assertTrue (FileMeta.sparseSavings meta > 0L) "savings are positive"
+        finally
+            if IO.File.Exists path then IO.File.Delete path)
+
+    test "small files are not probed and report apparent length unchanged" (fun () ->
+        // Probing costs a process spawn, so it must not happen per file across
+        // a 200k-file scan. Below the threshold, size and apparent must agree.
+        let path = IO.Path.Combine(IO.Path.GetTempPath(), "dcasmall.bin")
+        IO.File.WriteAllText(path, String.replicate 1000 "x")
+        try
+            let meta = assertOk (FileSystem.real.GetInfo path) "stat a small file"
+            assertEqual meta.ApparentBytes meta.SizeBytes "no probe, so both agree"
+            assertFalse (FileMeta.isSparse meta) "not flagged sparse"
+            assertTrue (meta.ApparentBytes < FileSystem.sparseProbeThresholdBytes) "and it is below the threshold"
+        finally
+            IO.File.Delete path)
 

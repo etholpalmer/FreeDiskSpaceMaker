@@ -14,6 +14,7 @@ open RiskEngine
 let private meta path size =
     { Path = path
       SizeBytes = size
+      ApparentBytes = size
       LastAccess = DateTime.UtcNow.AddDays -10.0
       LastModified = DateTime.UtcNow.AddDays -10.0
       Created = DateTime.UtcNow.AddDays -100.0

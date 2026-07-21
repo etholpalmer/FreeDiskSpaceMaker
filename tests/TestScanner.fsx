@@ -30,12 +30,12 @@ let private testRule name root risk safeToDelete includes : Rule =
       Category = Caches }
 
 let private tree =
-    [ { Path = "/"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-      { Path = "/cache"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-      { Path = "/cache/a.tmp"; SizeBytes = 1000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
-      { Path = "/cache/b.tmp"; SizeBytes = 2000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 60.0 }
-      { Path = "/data"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-      { Path = "/data/keep.txt"; SizeBytes = 3000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 } ]
+    [ { Path = "/"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+      { Path = "/cache"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+      { Path = "/cache/a.tmp"; SizeBytes = 1000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0; ApparentBytes = None }
+      { Path = "/cache/b.tmp"; SizeBytes = 2000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 60.0; ApparentBytes = None }
+      { Path = "/data"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+      { Path = "/data/keep.txt"; SizeBytes = 3000L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0; ApparentBytes = None } ]
 
 let run () =
     suite "Scanner"
@@ -114,9 +114,9 @@ let run () =
 
     test "nested roots do not double-count a file" (fun () ->
         let nestedTree =
-            [ { Path = "/outer"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-              { Path = "/outer/inner"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-              { Path = "/outer/inner/f.tmp"; SizeBytes = 500L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 } ]
+            [ { Path = "/outer"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+              { Path = "/outer/inner"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+              { Path = "/outer/inner/f.tmp"; SizeBytes = 500L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0; ApparentBytes = None } ]
         let nestedFs = FileSystem.inMemory nestedTree
         let rules : ResolvedRule list =
             [ { Rule = testRule "Outer" "/outer" Safe true []; Root = "/outer" }
@@ -127,9 +127,9 @@ let run () =
 
     test "nested roots do not inflate reclaimable bytes" (fun () ->
         let nestedTree =
-            [ { Path = "/outer"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-              { Path = "/outer/inner"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-              { Path = "/outer/inner/f.tmp"; SizeBytes = 500L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 } ]
+            [ { Path = "/outer"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+              { Path = "/outer/inner"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+              { Path = "/outer/inner/f.tmp"; SizeBytes = 500L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0; ApparentBytes = None } ]
         let nestedFs = FileSystem.inMemory nestedTree
         let rules : ResolvedRule list =
             [ { Rule = testRule "Outer" "/outer" Safe true []; Root = "/outer" }
@@ -139,10 +139,10 @@ let run () =
 
     test "nested-root deduplication does not lose coverage" (fun () ->
         let nestedTree =
-            [ { Path = "/outer"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-              { Path = "/outer/shallow.tmp"; SizeBytes = 100L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
-              { Path = "/outer/inner"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-              { Path = "/outer/inner/deep.tmp"; SizeBytes = 500L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 } ]
+            [ { Path = "/outer"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+              { Path = "/outer/shallow.tmp"; SizeBytes = 100L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0; ApparentBytes = None }
+              { Path = "/outer/inner"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+              { Path = "/outer/inner/deep.tmp"; SizeBytes = 500L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0; ApparentBytes = None } ]
         let nestedFs = FileSystem.inMemory nestedTree
         let rules : ResolvedRule list =
             [ { Rule = testRule "Outer" "/outer" Safe true []; Root = "/outer" }
@@ -153,10 +153,10 @@ let run () =
 
     test "sibling non-nested roots are both walked" (fun () ->
         let siblingTree =
-            [ { Path = "/a"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-              { Path = "/a/one.tmp"; SizeBytes = 100L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 }
-              { Path = "/b"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-              { Path = "/b/two.tmp"; SizeBytes = 200L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 } ]
+            [ { Path = "/a"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+              { Path = "/a/one.tmp"; SizeBytes = 100L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0; ApparentBytes = None }
+              { Path = "/b"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+              { Path = "/b/two.tmp"; SizeBytes = 200L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0; ApparentBytes = None } ]
         let siblingFs = FileSystem.inMemory siblingTree
         let rules : ResolvedRule list =
             [ { Rule = testRule "A" "/a" Safe true []; Root = "/a" }
@@ -211,9 +211,9 @@ let run () =
 
     test "duplicates are grouped, reported separately, and never gain a deletion candidate" (fun () ->
         let dupTree =
-            [ { Path = "/dup"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0 }
-              { Path = "/dup/a.bin"; SizeBytes = 4096L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 10.0 }
-              { Path = "/dup/b.bin"; SizeBytes = 4096L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0 } ]
+            [ { Path = "/dup"; SizeBytes = 0L; IsDirectory = true; LinkTarget = None; ModifiedDaysAgo = 1.0; ApparentBytes = None }
+              { Path = "/dup/a.bin"; SizeBytes = 4096L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 10.0; ApparentBytes = None }
+              { Path = "/dup/b.bin"; SizeBytes = 4096L; IsDirectory = false; LinkTarget = None; ModifiedDaysAgo = 5.0; ApparentBytes = None } ]
         let dupFs = FileSystem.inMemory dupTree
         // Lowered so the 4096-byte fixture files clear the duplicate-hashing
         // floor; the default (1 MB) is for the hasher, not for this test.

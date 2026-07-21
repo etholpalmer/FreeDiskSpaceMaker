@@ -9,6 +9,7 @@ open Types
 let private sample () : Scanner.ScanResult =
     let meta path size =
         { Path = path; SizeBytes = size
+          ApparentBytes = size
           LastAccess = DateTime.UtcNow; LastModified = DateTime.UtcNow
           Created = DateTime.UtcNow; IsDirectory = false
           LinkTarget = None; Owner = "u"; Mode = "rw-r--r--" }
