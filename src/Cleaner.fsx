@@ -25,7 +25,12 @@ type TrashResult =
       BytesMoved: int64 }
 
 /// One journal entry, written before its move is attempted.
-type private JournalEntry =
+///
+/// Must NOT be `private`. System.Text.Json serializes only public properties,
+/// and an F# private record type exposes none — every entry then serializes as
+/// `{}`. This shipped: a real run journaled 94,488 empty objects, leaving no
+/// audit trail for the 15.2 GB it had just moved.
+type JournalEntry =
     { Path: string
       RuleName: string
       SizeBytes: int64

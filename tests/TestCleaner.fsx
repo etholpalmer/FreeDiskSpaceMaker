@@ -79,3 +79,18 @@ let run () =
         assertFalse (taken.Contains chosen) "chosen destination is free"
         assertContains "a.txt" chosen "derived from the original name")
 
+    test "journal entries serialize with their fields, not as empty objects" (fun () ->
+        // System.Text.Json serializes only public properties. Marking
+        // JournalEntry `private` made every entry serialize as `{}` — which
+        // shipped, and produced 94,488 empty records for a real 15.2 GB run.
+        // The journal is the only audit trail of what was moved, so an empty
+        // one is worse than none: it looks like a record and is not.
+        let entry : Cleaner.JournalEntry =
+            { Path = "/x/a.tmp"; RuleName = "User Caches"
+              SizeBytes = 4096L; AttemptedAtUtc = "2026-07-21T00:00:00Z" }
+        let json = Text.Json.JsonSerializer.Serialize(entry, Dto.serializerOptions)
+        assertFalse (json.Trim() = "{}") "must not serialize as an empty object"
+        assertContains "/x/a.tmp" json "path is present"
+        assertContains "User Caches" json "rule name is present"
+        assertContains "4096" json "size is present")
+
