@@ -155,3 +155,92 @@ let run () =
             if IO.File.Exists script then IO.File.Delete script
             if IO.Directory.Exists sandbox then IO.Directory.Delete(sandbox, true))
 
+    // The pre-move recheck: each test approves a real candidate, then swaps
+    // what is on disk before the move, exactly as could happen while the user
+    // sits at the confirmation prompt. The swap must be refused, not moved.
+    let withSwappedEntry (name: string) (swap: string -> unit) (expectedReason: string) =
+        let sandbox = IO.Path.Combine(IO.Path.GetTempPath(), "dcarecheck-" + name)
+        if IO.Directory.Exists sandbox then IO.Directory.Delete(sandbox, true)
+        IO.Directory.CreateDirectory sandbox |> ignore
+        let victim = IO.Path.Combine(sandbox, "target.cache")
+        IO.File.WriteAllText(victim, String.replicate 64 "x")
+        try
+            let rule : Rules.ResolvedRule =
+                { Rule = { Name = "Recheck"; Platforms = Set.ofList [ MacOS; Linux; Windows ]
+                           Root = Absolute sandbox; Include = []; Exclude = []
+                           Risk = Safe; Recoverability = Regenerated; Strategy = ContentsOnly
+                           MinAge = None; MinSize = None; SafeToDelete = true
+                           Description = "d"; Reason = "r"; EstimatedBenefit = "e"
+                           Examples = [ "x" ]; Category = Caches }
+                  Root = sandbox }
+            let meta = assertOk (Platform.FileSystem.real.GetInfo victim) "stat before swap"
+            let candidate = assertOk (RiskEngine.evaluate false rule meta) "approved while intact"
+            swap victim
+            let outcome =
+                Cleaner.moveToTrash Platform.FileSystem.real (Logging.create Logging.Error)
+                    DateTime.Now [ candidate ]
+            assertEqual 0 outcome.Moved.Length "nothing was moved"
+            assertEqual 1 outcome.Failed.Length "the swap was reported as a failure"
+            let _, err = List.head outcome.Failed
+            assertContains expectedReason (Types.FsError.toText err) "refused for the right reason"
+        finally
+            if IO.Directory.Exists sandbox then IO.Directory.Delete(sandbox, true)
+
+    test "recheck refuses a file swapped for a symlink after approval" (fun () ->
+        // Moving would relocate the link while the user believes a cache file
+        // is being cleared.
+        withSwappedEntry "link"
+            (fun victim ->
+                IO.File.Delete victim
+                IO.File.CreateSymbolicLink(victim, "/etc/hosts") |> ignore)
+            "symbolic link")
+
+    test "recheck refuses a file swapped for a directory after approval" (fun () ->
+        // Directories report size 0, so a zero-byte candidate would pass a
+        // size-only check and Directory.Move would relocate whatever is there.
+        withSwappedEntry "dir"
+            (fun victim ->
+                IO.File.Delete victim
+                IO.Directory.CreateDirectory victim |> ignore)
+            "directory")
+
+    test "recheck still refuses a file whose size changed" (fun () ->
+        withSwappedEntry "size"
+            (fun victim -> IO.File.WriteAllText(victim, "different length entirely"))
+            "changed since the scan")
+
+    test "an intact candidate is still moved" (fun () ->
+        // The guard must refuse swaps without refusing legitimate work.
+        let sandbox = IO.Path.Combine(IO.Path.GetTempPath(), "dcarecheck-ok")
+        if IO.Directory.Exists sandbox then IO.Directory.Delete(sandbox, true)
+        IO.Directory.CreateDirectory sandbox |> ignore
+        let victim = IO.Path.Combine(sandbox, "intact.cache")
+        IO.File.WriteAllText(victim, "regenerable")
+        let stamp = DateTime.Now
+        try
+            let rule : Rules.ResolvedRule =
+                { Rule = { Name = "Recheck"; Platforms = Set.ofList [ MacOS; Linux; Windows ]
+                           Root = Absolute sandbox; Include = []; Exclude = []
+                           Risk = Safe; Recoverability = Regenerated; Strategy = ContentsOnly
+                           MinAge = None; MinSize = None; SafeToDelete = true
+                           Description = "d"; Reason = "r"; EstimatedBenefit = "e"
+                           Examples = [ "x" ]; Category = Caches }
+                  Root = sandbox }
+            let meta = assertOk (Platform.FileSystem.real.GetInfo victim) "stat"
+            let candidate = assertOk (RiskEngine.evaluate false rule meta) "approved"
+            let outcome =
+                Cleaner.moveToTrash Platform.FileSystem.real (Logging.create Logging.Error)
+                    stamp [ candidate ]
+            assertEqual 1 outcome.Moved.Length "the intact file moved"
+            assertEqual 0 outcome.Failed.Length "no spurious refusal"
+        finally
+            // Remove what the move put in the Trash, so the suite leaves nothing.
+            match Cleaner.trashRoot () with
+            | Ok root ->
+                let placed = Cleaner.destinationFor root (Cleaner.runFolderName stamp) victim
+                if IO.File.Exists placed then IO.File.Delete placed
+                let runDir = IO.Path.Combine(root, Cleaner.runFolderName stamp)
+                if IO.Directory.Exists runDir then IO.Directory.Delete(runDir, true)
+            | Error _ -> ()
+            if IO.Directory.Exists sandbox then IO.Directory.Delete(sandbox, true))
+

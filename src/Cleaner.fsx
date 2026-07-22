@@ -134,9 +134,14 @@ let writeJournal (path: string) (candidates: RiskEngine.DeletionCandidate list) 
 
 /// Moves every candidate into the Trash.
 ///
-/// Each item is re-checked immediately before its move: if it changed since
-/// the scan, it is skipped rather than moved, because the thing being removed
-/// is no longer the thing that was evaluated.
+/// Immediately before each move, every property the risk engine relied on is
+/// re-asserted: the entry must still exist, still be the same size, still not
+/// be a symlink, still not be a directory, and still be outside every protected
+/// location. Anything that fails is skipped and reported in `Failed`, never
+/// moved — the thing on disk is no longer the thing that was approved.
+///
+/// This matters because the window is unbounded: the flow blocks on the user's
+/// confirmation prompt between evaluation and here.
 let moveToTrash
     (fs: Platform.FileSystemOps)
     (log: Logging.Logger)
@@ -185,14 +190,43 @@ let moveToTrash
         let source = RiskEngine.candidatePath candidate
         let expectedSize = RiskEngine.candidateSize candidate
 
-        // Re-stat before moving. A file that changed since the scan was not
-        // the file the risk engine approved.
+        // Re-stat before moving, and re-assert every property the risk engine
+        // relied on. The window between evaluation and this point is unbounded:
+        // the flow blocks on the user's confirmation prompt. Anything that
+        // changed in that window was not what was approved.
+        //
+        // Size alone is not enough. A zero-byte candidate replaced by a
+        // directory would match on size, because directories report 0.
+        // A file replaced by a symlink would let Move relocate the link while
+        // the user believes a cache file is being cleared.
+        //
+        // The veto is re-run rather than trusted from evaluation time, because
+        // `denylist` resolves the home directory per call: a path that was
+        // outside protected territory when scanned could be inside it now.
+        let refuse (reason: string) =
+            log |> Logging.warn (sprintf "skipping %s: %s" source reason)
+            failed.Add(source, Types.IoFailure(source, reason))
+
+        // Type checks precede the size check deliberately. They are the more
+        // specific diagnosis, and the size check cannot substitute for them:
+        // a zero-byte candidate replaced by a directory matches on size,
+        // because directories report 0.
         match fs.GetInfo source with
         | Error e ->
             failed.Add(source, e)
+        | Ok current when current.LinkTarget.IsSome ->
+            // evaluate refuses symlinks outright, so this can only mean the
+            // entry was swapped after approval.
+            refuse "is now a symbolic link"
+        | Ok current when current.IsDirectory ->
+            // The walker emits only files, so every candidate was approved as
+            // a file. If WholeDirectory ever becomes reachable, this check must
+            // learn what the candidate was approved as rather than assuming.
+            refuse "is now a directory"
+        | Ok _ when RiskEngine.isVetoed source ->
+            refuse "is now inside a protected location"
         | Ok current when current.SizeBytes <> expectedSize ->
-            log |> Logging.warn (sprintf "skipping %s: changed since the scan" source)
-            failed.Add(source, Types.IoFailure(source, "changed since the scan"))
+            refuse "changed since the scan"
         | Ok _ ->
             try
                 // Choosing a destination probes the filesystem, so it belongs
