@@ -1,0 +1,436 @@
+(**
+    The rule catalog.
+
+    A rule is a pure data description of a location, what lives there, and how
+    dangerous it is to remove. The scanner is parameterized over `Rule list` and
+    contains no rule-specific logic, so **adding a rule means appending a record
+    here** — no other file changes.
+
+    Two invariants are enforced by tests rather than by types, because they
+    concern combinations of fields:
+      * Only a rule at risk level `Safe` may set `SafeToDelete = true`.
+      * No `SafeToDelete` rule may target a user-data directory.
+*)
+module Rules
+
+open System
+
+open Types
+open Utilities
+
+/// A declarative description of a cleanup target.
+type Rule =
+    { /// Unique, stable identifier. Referenced by config riskOverrides.
+      Name: string
+      /// Which operating systems this rule applies to.
+      Platforms: Set<Types.Platform>
+      /// Where to look, resolved against the environment at startup.
+      Root: PathSpec
+      /// Globs relative to Root. Empty means "everything under Root".
+      Include: string list
+      /// Globs relative to Root that are excluded from matching.
+      Exclude: string list
+      /// How dangerous removal is.
+      Risk: RiskLevel
+      /// How the item can be recovered after removal.
+      Recoverability: Recoverability
+      /// How matched items should be removed.
+      Strategy: DeleteStrategy
+      /// Items younger than this are not candidates. None means no age floor.
+      MinAge: TimeSpan option
+      /// Items smaller than this are not candidates. None means no size floor.
+      MinSize: int64 option
+      /// Whether this rule permits automatic deletion. Only ever true at Safe.
+      SafeToDelete: bool
+      /// What this location contains.
+      Description: string
+      /// Why it is (or is not) disposable.
+      Reason: string
+      /// Rough expected reclaim, for report prioritization.
+      EstimatedBenefit: string
+      /// Concrete example paths, shown in verbose reports.
+      Examples: string list
+      /// Report grouping.
+      Category: Category }
+
+/// A rule whose root resolved to a real, existing path on this machine.
+type ResolvedRule = { Rule: Rule; Root: string }
+
+/// Shorthand for a rule with the common defaults filled in, so each catalog
+/// entry states only what distinguishes it.
+let private rule name platforms root category =
+    { Name = name
+      Platforms = Set.ofList platforms
+      Root = root
+      Include = []
+      Exclude = []
+      Risk = Review
+      Recoverability = Unrecoverable
+      Strategy = MatchingFiles
+      MinAge = None
+      MinSize = None
+      SafeToDelete = false
+      Description = ""
+      Reason = ""
+      EstimatedBenefit = ""
+      Examples = []
+      Category = category }
+
+/// Marks a rule as safely deletable. Sets both fields together so the
+/// SafeToDelete/Risk pair can never drift apart.
+let private safe (r: Rule) = { r with Risk = Safe; SafeToDelete = true }
+
+// ---------------------------------------------------------------------------
+// macOS catalog — complete
+// ---------------------------------------------------------------------------
+
+let private macOsRules: Rule list =
+    [ { rule "User Caches" [ MacOS ] (HomeRelative "Library/Caches") Caches with
+          Strategy = ContentsOnly
+          Recoverability = Regenerated
+          Description = "Application caches for the current user."
+          Reason = "Applications regenerate these on demand. Removing them costs a one-time slowdown, nothing more."
+          EstimatedBenefit = "1-20 GB"
+          Examples = [ "~/Library/Caches/com.apple.Safari"; "~/Library/Caches/JetBrains" ] } |> safe
+
+      { rule "User Logs" [ MacOS ] (HomeRelative "Library/Logs") Logs with
+          Strategy = ContentsOnly
+          Recoverability = Regenerated
+          MinAge = Some (TimeSpan.FromDays 7.0)
+          Description = "Application log files for the current user."
+          Reason = "Diagnostic output. Only useful while investigating a recent problem."
+          EstimatedBenefit = "100 MB - 2 GB"
+          Examples = [ "~/Library/Logs/DiagnosticReports" ] } |> safe
+
+      { rule "Crash Reports" [ MacOS ] (HomeRelative "Library/Application Support/CrashReporter") CrashReports with
+          Strategy = ContentsOnly
+          Recoverability = Unrecoverable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = "Saved crash reports."
+          Reason = "Useful only when actively diagnosing a crash. Older reports refer to versions no longer installed."
+          EstimatedBenefit = "10-500 MB"
+          Examples = [ "~/Library/Application Support/CrashReporter/*.plist" ] } |> safe
+
+      { rule "Xcode DerivedData" [ MacOS ] (HomeRelative "Library/Developer/Xcode/DerivedData") DeveloperArtifacts with
+          Strategy = ContentsOnly
+          Recoverability = Regenerated
+          Description = "Xcode build intermediates, indexes, and module caches."
+          Reason = "Fully regenerated by a rebuild. Frequently the single largest reclaimable directory on a developer Mac. The directory itself is kept because Xcode expects it to exist."
+          EstimatedBenefit = "5-50 GB"
+          Examples = [ "~/Library/Developer/Xcode/DerivedData/MyApp-abc123" ] } |> safe
+
+      { rule "Xcode Archives" [ MacOS ] (HomeRelative "Library/Developer/Xcode/Archives") DeveloperArtifacts with
+          Risk = Review
+          Recoverability = Unrecoverable
+          MinAge = Some (TimeSpan.FromDays 90.0)
+          Description = "Archived application builds produced for distribution."
+          Reason = "These contain the dSYM files needed to symbolicate crash reports from released builds. Removing an archive for a version still in the wild makes its crash reports unreadable. Reviewed, never automatic."
+          EstimatedBenefit = "1-20 GB"
+          Examples = [ "~/Library/Developer/Xcode/Archives/2024-01-15" ] }
+
+      { rule "Xcode iOS DeviceSupport" [ MacOS ] (HomeRelative "Library/Developer/Xcode/iOS DeviceSupport") DeveloperArtifacts with
+          Strategy = ContentsOnly
+          Recoverability = Regenerated
+          MinAge = Some (TimeSpan.FromDays 60.0)
+          Description = "Debug symbols cached per connected iOS device and OS version."
+          Reason = "Regenerated when a device running that OS version is next connected. Old iOS versions accumulate indefinitely."
+          EstimatedBenefit = "2-30 GB"
+          Examples = [ "~/Library/Developer/Xcode/iOS DeviceSupport/17.2 (21C62)" ] } |> safe
+
+      { rule "CoreSimulator Caches" [ MacOS ] (HomeRelative "Library/Developer/CoreSimulator/Caches") DeveloperArtifacts with
+          Strategy = ContentsOnly
+          Recoverability = Regenerated
+          Description = "iOS Simulator runtime caches."
+          Reason = "Regenerated by the simulator on next launch."
+          EstimatedBenefit = "500 MB - 5 GB"
+          Examples = [ "~/Library/Developer/CoreSimulator/Caches/dyld" ] } |> safe
+
+      { rule "CoreSimulator Devices" [ MacOS ] (HomeRelative "Library/Developer/CoreSimulator/Devices") DeveloperArtifacts with
+          Risk = Review
+          Recoverability = Unrecoverable
+          Description = "Simulated device containers, including their installed apps and data."
+          Reason = "These hold app state a developer may be mid-test against. Removal is safe in principle but destroys simulator state without warning, so it is surfaced for review rather than deleted."
+          EstimatedBenefit = "1-20 GB"
+          Examples = [ "~/Library/Developer/CoreSimulator/Devices/ABC-123" ] }
+
+      { rule "Container Caches" [ MacOS ] (HomeRelative "Library/Containers") ContainerData with
+          Include = [ "*/Data/Library/Caches/**"; "*/Data/tmp/**" ]
+          Strategy = MatchingFiles
+          Recoverability = Regenerated
+          Description = "Cache and temporary directories inside sandboxed application containers."
+          Reason = "Only these two subpaths within a container are regenerable. Everything else in a container is application state."
+          EstimatedBenefit = "500 MB - 10 GB"
+          Examples = [ "~/Library/Containers/com.apple.Notes/Data/Library/Caches" ] } |> safe
+
+      { rule "Container Data" [ MacOS ] (HomeRelative "Library/Containers") ContainerData with
+          Risk = Review
+          Recoverability = Unrecoverable
+          Description = "All other data inside sandboxed application containers."
+          Reason = "Sandboxed applications store documents, preferences, and databases here. This is user data and is never removed automatically."
+          EstimatedBenefit = "reported only"
+          Examples = [ "~/Library/Containers/com.apple.Notes/Data/Documents" ] }
+
+      { rule "Trash" [ MacOS ] (HomeRelative ".Trash") TrashContents with
+          Risk = Review
+          Recoverability = Unrecoverable
+          Description = "Items already in the Trash."
+          Reason = "This space is not reclaimed until the Trash is emptied. This tool reports the amount but will not empty the Trash, because doing so is the one action that makes its own deletions irreversible."
+          EstimatedBenefit = "reported only"
+          Examples = [ "~/.Trash" ] }
+
+      { rule "Safari Cache" [ MacOS ] (HomeRelative "Library/Caches/com.apple.Safari") BrowserCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Safari's on-disk web cache."
+          Reason = "Re-downloaded as you browse."
+          EstimatedBenefit = "100 MB - 2 GB"
+          Examples = [ "~/Library/Caches/com.apple.Safari/WebKitCache" ] } |> safe
+
+      { rule "Chrome Cache" [ MacOS ] (HomeRelative "Library/Caches/Google/Chrome") BrowserCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Google Chrome's on-disk web cache."
+          Reason = "Re-downloaded as you browse. Does not include profiles, history, or passwords, which live elsewhere."
+          EstimatedBenefit = "200 MB - 3 GB"
+          Examples = [ "~/Library/Caches/Google/Chrome/Default/Cache" ] } |> safe
+
+      { rule "Firefox Cache" [ MacOS ] (HomeRelative "Library/Caches/Firefox") BrowserCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Firefox's on-disk web cache."
+          Reason = "Re-downloaded as you browse."
+          EstimatedBenefit = "100 MB - 2 GB"
+          Examples = [ "~/Library/Caches/Firefox/Profiles" ] } |> safe
+
+      { rule "NuGet Package Cache" [ MacOS; Linux ] (HomeRelative ".nuget/packages") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = ".NET package cache."
+          Reason = "Re-downloaded by `dotnet restore`. Grows without bound across projects and framework versions."
+          EstimatedBenefit = "1-15 GB"
+          Examples = [ "~/.nuget/packages/newtonsoft.json" ] } |> safe
+
+      { rule "Homebrew Cache" [ MacOS ] (HomeRelative "Library/Caches/Homebrew") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Downloaded Homebrew bottles and source archives."
+          Reason = "Re-downloaded on demand. `brew cleanup` does the same thing."
+          EstimatedBenefit = "500 MB - 10 GB"
+          Examples = [ "~/Library/Caches/Homebrew/downloads" ] } |> safe
+
+      { rule "npm Cache" [ MacOS; Linux ] (HomeRelative ".npm/_cacache") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "npm's content-addressable package cache."
+          Reason = "Re-downloaded by `npm install`. Equivalent to `npm cache clean --force`."
+          EstimatedBenefit = "500 MB - 5 GB"
+          Examples = [ "~/.npm/_cacache/content-v2" ] } |> safe
+
+      { rule "pnpm Store" [ MacOS ] (HomeRelative "Library/pnpm/store") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = "pnpm's global content-addressable store."
+          Reason = "Re-downloaded on install. Note that pnpm hard-links from this store into project node_modules, so removing it forces a re-fetch for existing projects too."
+          EstimatedBenefit = "1-10 GB"
+          Examples = [ "~/Library/pnpm/store/v3" ] } |> safe
+
+      { rule "Yarn Cache" [ MacOS; Linux ] (HomeRelative ".yarn/cache") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Yarn's package cache."
+          Reason = "Re-downloaded by `yarn install`."
+          EstimatedBenefit = "200 MB - 3 GB"
+          Examples = [ "~/.yarn/cache" ] } |> safe
+
+      { rule "pip Cache" [ MacOS; Linux ] (HomeRelative "Library/Caches/pip") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Python wheel and HTTP cache."
+          Reason = "Re-downloaded by `pip install`. Equivalent to `pip cache purge`."
+          EstimatedBenefit = "100 MB - 2 GB"
+          Examples = [ "~/Library/Caches/pip/wheels" ] } |> safe
+
+      { rule "Gradle Cache" [ MacOS; Linux ] (HomeRelative ".gradle/caches") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = "Gradle dependency and build cache."
+          Reason = "Re-downloaded and rebuilt on next build."
+          EstimatedBenefit = "1-20 GB"
+          Examples = [ "~/.gradle/caches/modules-2" ] } |> safe
+
+      { rule "Maven Repository" [ MacOS; Linux ] (HomeRelative ".m2/repository") PackageManagerCache with
+          Risk = ProbablySafe
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 60.0)
+          Description = "Maven's local artifact repository."
+          Reason = "Normally re-downloadable, but it can also contain artifacts installed locally via `mvn install` that exist nowhere else. Rated ProbablySafe rather than Safe for that reason."
+          EstimatedBenefit = "1-10 GB"
+          Examples = [ "~/.m2/repository/org/apache" ] }
+
+      { rule "Terraform Plugin Cache" [ MacOS; Linux ] (HomeRelative ".terraform.d/plugin-cache") PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          Description = "Cached Terraform provider binaries."
+          Reason = "Re-downloaded by `terraform init`."
+          EstimatedBenefit = "200 MB - 3 GB"
+          Examples = [ "~/.terraform.d/plugin-cache/registry.terraform.io" ] } |> safe
+
+      { rule "Docker Data" [ MacOS ] (HomeRelative "Library/Containers/com.docker.docker/Data") VirtualMachines with
+          Risk = Review
+          Recoverability = Unrecoverable
+          Description = "Docker Desktop's virtual machine disk image, holding all images, volumes, and containers."
+          Reason = "This is a single large sparse file containing every Docker volume, including databases a developer may depend on. Use `docker system prune` instead, which understands what is safe to remove — and unlike Podman, Docker Desktop does return the freed blocks to macOS, so the prune genuinely shrinks this file. Reported, never deleted."
+          EstimatedBenefit = "reported only — and the size shown is the image's apparent size, which for a sparse file overstates the blocks actually in use"
+          Examples = [ "~/Library/Containers/com.docker.docker/Data/vms/0/data" ] }
+
+      { rule "Podman Machine Images" [ MacOS ] (HomeRelative ".local/share/containers/podman") VirtualMachines with
+          Risk = Review
+          Recoverability = Unrecoverable
+          Description = "Podman virtual machine images, including any left behind after uninstalling Podman."
+          Reason = "A sparse disk image holding the whole Linux guest: container volumes, images and machine state. Note that `podman system prune` will NOT reclaim this — it cleans up inside the guest, so it does nothing while the machine is stopped, and even a successful prune leaves the host file the same size because freeing blocks inside a sparse image does not return them to macOS. Reclaiming the space means removing the machine itself with `podman machine rm <name>`, which destroys the guest filesystem and every volume in it. This directory also survives an uninstall: the official .pkg installs to /opt/podman, which Homebrew and Podman Desktop removal do not touch. Reported, never deleted."
+          EstimatedBenefit = "reported only — and the size shown is the image's apparent size, which for a sparse file overstates the blocks actually in use"
+          Examples = [ "~/.local/share/containers/podman/machine" ] }
+
+      { rule "Python Bytecode Caches" [ MacOS; Linux ] (HomeRelative "") DeveloperArtifacts with
+          Include = [ "**/__pycache__/**" ]
+          Strategy = MatchingFiles
+          Recoverability = Regenerated
+          Description = "Compiled Python bytecode."
+          Reason = "Regenerated automatically on next import."
+          EstimatedBenefit = "50-500 MB"
+          Examples = [ "~/Projects/app/__pycache__" ] } |> safe
+
+      { rule "node_modules Directories" [ MacOS; Linux ] (HomeRelative "") DeveloperArtifacts with
+          Include = [ "**/node_modules/**" ]
+          Risk = Review
+          Recoverability = Redownloadable
+          Description = "Installed JavaScript dependencies, per project."
+          Reason = "Reinstallable via the project's lockfile, but only if the project is still wanted and the lockfile is intact. These contain enormous file counts, so they are reported as a single aggregate per project rather than enumerated file by file."
+          EstimatedBenefit = "reported only"
+          Examples = [ "~/Projects/app/node_modules" ] }
+
+      { rule "Old Disk Images" [ MacOS ] (HomeRelative "Downloads") DiskImages with
+          Include = [ "*.dmg"; "*.iso"; "*.pkg" ]
+          Risk = Review
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 60.0)
+          Description = "Installer disk images and packages in Downloads."
+          Reason = "Usually re-downloadable from the vendor, but Downloads is user territory and may hold licensed installers that are no longer available. Reviewed, never automatic."
+          EstimatedBenefit = "1-20 GB"
+          Examples = [ "~/Downloads/Xcode_15.dmg" ] }
+
+      { rule "Old Archives" [ MacOS; Linux ] (HomeRelative "Downloads") Archives with
+          Include = [ "*.zip"; "*.tar"; "*.tar.gz"; "*.tgz"; "*.rar"; "*.7z" ]
+          Risk = Review
+          Recoverability = Unrecoverable
+          MinAge = Some (TimeSpan.FromDays 90.0)
+          Description = "Compressed archives in Downloads."
+          Reason = "Often already extracted and redundant, but the tool cannot tell which. Reviewed, never automatic."
+          EstimatedBenefit = "500 MB - 10 GB"
+          Examples = [ "~/Downloads/project-backup.zip" ] } ]
+
+// ---------------------------------------------------------------------------
+// Linux catalog — seeded
+// ---------------------------------------------------------------------------
+
+let private linuxRules: Rule list =
+    [ { rule "System Temp" [ Linux ] (Absolute "/tmp") TemporaryFiles with
+          Strategy = MatchingFiles
+          Recoverability = Regenerated
+          MinAge = Some (TimeSpan.FromDays 7.0)
+          Description = "System temporary directory."
+          Reason = "Cleared on reboot by most distributions. Files older than a week are abandoned."
+          EstimatedBenefit = "100 MB - 5 GB"
+          Examples = [ "/tmp/build-abc123" ] } |> safe
+
+      { rule "Persistent Temp" [ Linux ] (Absolute "/var/tmp") TemporaryFiles with
+          Risk = Review
+          Recoverability = Unrecoverable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = "Temporary files that survive reboot."
+          Reason = "Unlike /tmp, this is expected to persist, so long-running jobs legitimately keep state here."
+          EstimatedBenefit = "reported only"
+          Examples = [ "/var/tmp/systemd-private-abc" ] }
+
+      { rule "XDG User Cache" [ Linux ] (HomeRelative ".cache") Caches with
+          Strategy = ContentsOnly
+          Recoverability = Regenerated
+          Description = "Per-user application cache directory."
+          Reason = "Applications regenerate these on demand."
+          EstimatedBenefit = "500 MB - 10 GB"
+          Examples = [ "~/.cache/mozilla" ] } |> safe
+
+      { rule "Flatpak Unused Runtimes" [ Linux ] (HomeRelative ".local/share/flatpak") PackageManagerCache with
+          Risk = Review
+          Recoverability = Redownloadable
+          Description = "Installed Flatpak runtimes and applications."
+          Reason = "Use `flatpak uninstall --unused`, which knows which runtimes are still referenced. Reported only."
+          EstimatedBenefit = "reported only"
+          Examples = [ "~/.local/share/flatpak/runtime" ] } ]
+
+// ---------------------------------------------------------------------------
+// Windows catalog — seeded
+// ---------------------------------------------------------------------------
+
+let private windowsRules: Rule list =
+    [ { rule "User Temp" [ Windows ] (EnvRelative("TEMP", "")) TemporaryFiles with
+          Strategy = MatchingFiles
+          Recoverability = Regenerated
+          MinAge = Some (TimeSpan.FromDays 7.0)
+          Description = "Per-user temporary directory."
+          Reason = "Abandoned by the applications that created them."
+          EstimatedBenefit = "500 MB - 5 GB"
+          Examples = [ "%TEMP%\\nsy1234.tmp" ] } |> safe
+
+      { rule "Windows Update Cache" [ Windows ] (Absolute "C:\\Windows\\SoftwareDistribution\\Download") Caches with
+          Risk = ProbablySafe
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = "Downloaded Windows Update payloads."
+          Reason = "Re-downloaded if needed, but removing them mid-update interrupts a pending install."
+          EstimatedBenefit = "500 MB - 8 GB"
+          Examples = [ "C:\\Windows\\SoftwareDistribution\\Download" ] }
+
+      { rule "NuGet Package Cache (Windows)" [ Windows ] (EnvRelative("USERPROFILE", ".nuget\\packages")) PackageManagerCache with
+          Strategy = ContentsOnly
+          Recoverability = Redownloadable
+          MinAge = Some (TimeSpan.FromDays 30.0)
+          Description = ".NET package cache."
+          Reason = "Re-downloaded by `dotnet restore`."
+          EstimatedBenefit = "1-15 GB"
+          Examples = [ "%USERPROFILE%\\.nuget\\packages" ] } |> safe
+
+      { rule "Recycle Bin" [ Windows ] (Absolute "C:\\$Recycle.Bin") TrashContents with
+          Risk = Review
+          Recoverability = Unrecoverable
+          Description = "Items already in the Recycle Bin."
+          Reason = "This space is not reclaimed until the Recycle Bin is emptied, which this tool will not do."
+          EstimatedBenefit = "reported only"
+          Examples = [ "C:\\$Recycle.Bin" ] } ]
+
+/// Every rule across every platform.
+let catalog: Rule list = macOsRules @ linuxRules @ windowsRules
+
+/// Rules applicable to a given platform.
+let forPlatform (platform: Types.Platform) : Rule list =
+    catalog |> List.filter (fun r -> r.Platforms.Contains platform)
+
+/// Orders rules most-specific-first: longer resolved roots win, then
+/// declaration order. This is what lets a narrow rule inside a broad one
+/// take precedence — the Containers cache rule over the Containers catch-all.
+let byPrecedence (rules: ResolvedRule list) : ResolvedRule list =
+    rules |> List.sortBy (fun r -> -r.Root.Length)
+
+/// Resolves every applicable rule against this machine, dropping those whose
+/// root does not exist. A missing root simply means the tool that creates it
+/// is not installed.
+let resolveAll (fs: Platform.FileSystemOps) (platform: Types.Platform) : ResolvedRule list =
+    forPlatform platform
+    |> List.choose (fun r ->
+        match Platform.resolve r.Root with
+        | Some root when fs.Exists root -> Some { Rule = r; Root = root }
+        | _ -> None)
+    |> byPrecedence
