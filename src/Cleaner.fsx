@@ -60,6 +60,45 @@ let journalPath (timestamp: DateTime) : string =
     let name = sprintf "deletions-%s.json" (timestamp.ToString "yyyy-MM-dd-HHmmss")
     Path.Combine("reports", name)
 
+/// Where the generated restore script for a run is written.
+let restoreScriptPath (timestamp: DateTime) : string =
+    let name = sprintf "restore-%s.sh" (timestamp.ToString "yyyy-MM-dd-HHmmss")
+    Path.Combine("reports", name)
+
+/// The per-run folder inside the Trash that a run's items are moved into.
+///
+/// Runs are kept separate, and each run mirrors the original directory tree
+/// beneath this folder, so a move is reversible by path arithmetic alone.
+let runFolderName (timestamp: DateTime) : string =
+    sprintf "DiskCleanupAdvisor-%s" (timestamp.ToString "yyyy-MM-dd-HHmmss")
+
+/// Maps a source path to its destination inside the run folder, mirroring the
+/// original directory structure.
+///
+/// `/Users/x/Library/Caches/brew/a.tar.gz` becomes
+/// `<trash>/<run>/Users/x/Library/Caches/brew/a.tar.gz`.
+///
+/// An earlier version moved every file to the Trash root using its basename
+/// alone. That flattened 94,486 files into one directory, discarding the
+/// structure, and macOS records no "Put Back" information for a plain rename —
+/// so the original locations were unrecoverable. Mirroring the absolute path
+/// makes the destination a pure function of the source, which is what lets the
+/// generated restore script be correct without consulting any index.
+let destinationFor (trashRoot: string) (runFolder: string) (source: string) : string =
+    let normalized = Utilities.Path.normalize source
+    let relative = normalized.TrimStart(Path.DirectorySeparatorChar, '/')
+    Path.Combine(trashRoot, runFolder, relative)
+
+/// Recovers the original path from a destination produced by `destinationFor`.
+/// Exposed so the round trip can be asserted rather than assumed.
+let sourceFor (trashRoot: string) (runFolder: string) (destination: string) : string =
+    let prefix = Utilities.Path.normalize (Path.Combine(trashRoot, runFolder))
+    let normalized = Utilities.Path.normalize destination
+    if normalized.StartsWith prefix then
+        let tail = normalized.Substring(prefix.Length).TrimStart(Path.DirectorySeparatorChar, '/')
+        string Path.DirectorySeparatorChar + tail
+    else normalized
+
 /// Chooses a destination filename that does not already exist.
 ///
 /// `exists` is passed in rather than called directly so the collision logic
@@ -101,8 +140,11 @@ let writeJournal (path: string) (candidates: RiskEngine.DeletionCandidate list) 
 let moveToTrash
     (fs: Platform.FileSystemOps)
     (log: Logging.Logger)
+    (timestamp: DateTime)
     (candidates: RiskEngine.DeletionCandidate list)
     : TrashResult =
+
+    let runFolder = runFolderName timestamp
 
     match trashRoot () with
     | Error message ->
@@ -156,8 +198,22 @@ let moveToTrash
                 // Choosing a destination probes the filesystem, so it belongs
                 // inside the guard: a permission failure here would otherwise
                 // escape and abandon the remaining candidates unreported.
+                //
+                // The destination mirrors the source's absolute path beneath
+                // the run folder, so structure survives and restoring is path
+                // arithmetic. uniqueDestination remains as a last-resort guard;
+                // mirroring makes a collision almost impossible, but silently
+                // overwriting an already-trashed file is the one outcome this
+                // tool must never produce.
+                let mirrored = destinationFor trash runFolder source
+                let parent = Path.GetDirectoryName mirrored
+                if not (String.IsNullOrEmpty parent) && not (Directory.Exists parent) then
+                    Directory.CreateDirectory parent |> ignore
                 let destination =
-                    uniqueDestination (fun p -> File.Exists p || Directory.Exists p) trash (Path.GetFileName source)
+                    uniqueDestination
+                        (fun p -> File.Exists p || Directory.Exists p)
+                        parent
+                        (Path.GetFileName mirrored)
                 // Move, never delete. On a cross-device move File.Move copies
                 // then removes the source, which is still a relocation.
                 if Directory.Exists source then Directory.Move(source, destination)
@@ -172,3 +228,66 @@ let moveToTrash
     { Moved = List.ofSeq moved
       Failed = List.ofSeq failed
       BytesMoved = bytesMoved }
+
+/// Writes a shell script that moves a run's items back where they came from.
+///
+/// The tool moves files into the Trash rather than unlinking them, but that is
+/// only half of reversibility: the user also needs to know where each item
+/// belongs. macOS records no "Put Back" information for a plain rename, so this
+/// script is the restore path. It is generated from the same run folder the
+/// move used, so it stays correct without consulting the journal.
+///
+/// The script is deliberately conservative: it refuses to overwrite an existing
+/// file, recreates missing parent directories, counts what it did, and reports
+/// anything it skipped. It never deletes.
+let writeRestoreScript
+    (path: string)
+    (trashRoot: string)
+    (timestamp: DateTime)
+    (candidates: RiskEngine.DeletionCandidate list)
+    : Result<unit, string> =
+    try
+        let runFolder = runFolderName timestamp
+        let builder = Text.StringBuilder()
+        let line (text: string) = builder.AppendLine text |> ignore
+
+        line "#!/bin/sh"
+        line "# Restores items moved to the Trash by DiskCleanupAdvisor."
+        line (sprintf "# Run: %s" runFolder)
+        line (sprintf "# Items: %d" candidates.Length)
+        line "#"
+        line "# Safe to re-run: existing files are never overwritten, and nothing"
+        line "# is deleted. Anything already restored is reported as skipped."
+        line "set -u"
+        line "restored=0; skipped=0; missing=0"
+        line ""
+        line "restore() {"
+        line "  src=\"$1\"; dst=\"$2\""
+        line "  if [ ! -e \"$src\" ]; then missing=$((missing+1)); return; fi"
+        line "  if [ -e \"$dst\" ]; then"
+        line "    echo \"skip (destination exists): $dst\"; skipped=$((skipped+1)); return"
+        line "  fi"
+        line "  mkdir -p \"$(dirname \"$dst\")\" || { echo \"skip (cannot create parent): $dst\"; skipped=$((skipped+1)); return; }"
+        line "  if mv \"$src\" \"$dst\"; then restored=$((restored+1));"
+        line "  else echo \"skip (move failed): $src\"; skipped=$((skipped+1)); fi"
+        line "}"
+        line ""
+
+        for candidate in candidates do
+            let source = RiskEngine.candidatePath candidate
+            let trashed = destinationFor trashRoot runFolder source
+            // Single-quote and escape for sh: ' -> '\''
+            let quote (value: string) = "'" + value.Replace("'", "'\\''") + "'"
+            line (sprintf "restore %s %s" (quote trashed) (quote source))
+
+        line ""
+        line "echo \"restored $restored, skipped $skipped, missing $missing\""
+
+        let directory = Path.GetDirectoryName path
+        if not (String.IsNullOrEmpty directory) && not (Directory.Exists directory) then
+            Directory.CreateDirectory directory |> ignore
+        File.WriteAllText(path, builder.ToString())
+        try File.SetUnixFileMode(path, UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+        with _ -> ()   // best effort; Windows has no Unix mode
+        Ok ()
+    with ex -> Error (sprintf "cannot write the restore script to %s: %s" path ex.Message)

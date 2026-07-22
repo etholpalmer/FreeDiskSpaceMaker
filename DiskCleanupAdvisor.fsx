@@ -151,16 +151,30 @@ let private main () : int =
                     printf  "Type 'yes' to continue: "
                     match Console.ReadLine() with
                     | "yes" ->
-                        let journal = Cleaner.journalPath DateTime.Now
+                        // One timestamp ties the journal, the Trash run folder
+                        // and the restore script together.
+                        let stamp = DateTime.Now
+                        let journal = Cleaner.journalPath stamp
                         match Cleaner.writeJournal journal candidates with
                         | Error e -> fail [ e ]
                         | Ok () ->
-                            let outcome = Cleaner.moveToTrash fs log candidates
+                            // Written before the move, like the journal: if the
+                            // run dies partway, the script still restores
+                            // whatever did make it into the Trash.
+                            let restoreScript = Cleaner.restoreScriptPath stamp
+                            match Cleaner.trashRoot () with
+                            | Ok root ->
+                                match Cleaner.writeRestoreScript restoreScript root stamp candidates with
+                                | Ok () -> log |> Logging.info (sprintf "wrote restore script to %s" restoreScript)
+                                | Error e -> log |> Logging.warn e
+                            | Error e -> log |> Logging.warn e
+                            let outcome = Cleaner.moveToTrash fs log stamp candidates
                             printfn ""
                             printfn "Moved %d items (%s) to the Trash."
                                 outcome.Moved.Length (Utilities.Format.bytes outcome.BytesMoved)
                             // Stated plainly: the space is not back yet.
                             printfn "Empty the Trash to actually reclaim this space."
+                            printfn "To undo this run:  sh %s" (Cleaner.restoreScriptPath stamp)
                             if not (List.isEmpty outcome.Failed) then
                                 printfn "%d items could not be moved; see %s" outcome.Failed.Length journal
                             0
