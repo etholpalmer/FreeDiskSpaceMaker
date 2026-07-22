@@ -267,23 +267,6 @@ The first three were recoverable with better unit fixtures. The last three requi
 
 ## Solution Gaps
 
-### 2026-07-21 — Cleaner's pre-move recheck verifies size only
-
-**Current State:** Before each move, `Cleaner` re-`stat`s the file and skips it if `SizeBytes` differs from what `evaluate` approved (`src/Cleaner.fsx:122-134`).
-
-**Limitation:** It does not re-check `IsDirectory` or `LinkTarget`, and the window is unbounded because the flow blocks on `Console.ReadLine()`. A zero-byte candidate replaced by a directory would match, since directories report size `0`.
-
-**Mitigating measurement:** `Directory.Move` was verified to relocate a **symlink**, not its target — a real directory and its file survived untouched. So the worst case is a Trash move of the wrong entry, which remains reversible. This is why the finding is Important rather than Critical.
-
-**Closing this gap requires:**
-1. Assert `current.IsDirectory = false` and `current.LinkTarget.IsNone` in the recheck — 15 minutes — **pending**
-2. Re-run `RiskEngine.isVetoed` on the source as defence in depth — 15 minutes — **pending**
-3. Correct the docstring at `src/Cleaner.fsx:93-95`, which currently overstates what is checked — 5 minutes — **pending**
-
-**Priority:** Medium.
-
----
-
 ## Compromises
 
 ### 2026-07-21 — Parallel traversal declined despite a 90-second scan
@@ -350,6 +333,18 @@ The first three were recoverable with better unit fixtures. The last three requi
 
 > Entries moved here when the underlying condition no longer applies.
 > Kept for historical context.
+
+### Archived 2026-07-22 — Cleaner's pre-move recheck verified size only
+
+**Resolution:** Commit `9c8da9a`. The recheck now re-asserts every property `evaluate` relied on — not a symlink, not a directory, still outside every protected location, unchanged in size — and skips anything that fails. The veto is re-run rather than trusted from evaluation time, because `denylist` resolves the home directory per call.
+
+**Writing the tests changed the fix.** With the size check first, a symlink swap was refused as *"changed since the scan"* — refused, but misdiagnosed. Reordering so type checks precede size gives the precise reason, and matters beyond diagnostics: the dangerous case is a zero-byte candidate replaced by a directory, where sizes match at 0 and only the type check catches it at all. The ordering was not in the original punch list; the tests produced it.
+
+**Verified by performing the swap, not by asserting the guard exists:** four tests approve a real candidate, swap what is on disk, and assert both the refusal and its reason. A fifth asserts an intact candidate still moves, so the guard cannot pass by refusing everything.
+
+**Original limitation:** size alone, across a window bounded only by how long the user takes at the confirmation prompt. Bounded to Important rather than Critical because `Directory.Move` was measured not to follow symlinks, so the worst outcome remained a reversible Trash move.
+
+---
 
 ### Archived 2026-07-22 — Time Machine snapshot reporting had never run against a live snapshot
 
