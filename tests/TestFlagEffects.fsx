@@ -133,6 +133,30 @@ let run () =
         assertContains "Large" expanded "the dedicated section appears"
         assertFalse (plain.Contains "Largest files") "and is absent by default")
 
+    test "--json-full includes every finding; the default caps them" (fun () ->
+        // A default report of 159,236 findings came to 112 MB at ~700 bytes
+        // each, which is unusable for anything but a machine. Capping is right,
+        // but a truncated document that looks complete would be the same class
+        // of defect as a silently partial scan — so truncation is declared.
+        let r = baseline ()
+        let capped = Report.Json.toDtoWithLimit (Some 2) r
+        let full = Report.Json.toDtoWithLimit None r
+        assertEqual 2 capped.Findings.Length "the cap is applied"
+        assertTrue capped.FindingsTruncated "and truncation is declared"
+        assertEqual 2 capped.FindingsIncluded "the included count is honest"
+        assertEqual r.Findings.Length full.Findings.Length "the flag includes everything"
+        assertFalse full.FindingsTruncated "a complete report says so"
+        assertEqual r.Findings.Length full.FindingsIncluded "counts agree when complete"
+        // Both report the same true total, so a consumer is never misled.
+        assertEqual capped.TotalItems full.TotalItems "TotalItems is the real total either way"
+        // The cap keeps the largest, which is what makes it useful.
+        let smallest = capped.Findings |> List.map (fun f -> f.SizeBytes) |> List.min
+        let excluded =
+            r.Findings |> List.map (fun f -> f.Meta.SizeBytes)
+            |> List.sortDescending |> List.skip 2
+        assertTrue (excluded |> List.forall (fun s -> s <= smallest))
+            "everything dropped is smaller than everything kept")
+
     suite "CLI flag coverage guard"
 
     test "every flag in the help text is classified as covered" (fun () ->
@@ -147,7 +171,7 @@ let run () =
 
         // Flags whose effect on scan results is asserted in this file.
         let behavioural =
-            set [ "--age"; "--min-size"; "--duplicates"; "--large-files"; "--hash-algorithm" ]
+            set [ "--age"; "--min-size"; "--duplicates"; "--large-files"; "--hash-algorithm"; "--json-full" ]
         // Flags that select a mode; covered by TestCli parse tests and by the
         // entry point refusing --delete until Cleaner exists.
         let modes = set [ "--scan"; "--delete"; "--dry-run"; "--help" ]

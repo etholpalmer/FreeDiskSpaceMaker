@@ -25,6 +25,8 @@ type Mode =
 type Options =
     { Mode: Mode
       JsonPath: string option
+      /// --json-full: include every finding rather than the largest few.
+      JsonFull: bool
       MarkdownPath: string option
       HtmlPath: string option
       ConfigPath: string option
@@ -42,6 +44,7 @@ type Options =
 let private empty: Options =
     { Mode = Scan
       JsonPath = None
+      JsonFull = false
       MarkdownPath = None
       HtmlPath = None
       ConfigPath = None
@@ -68,7 +71,9 @@ MODES
     --help                  Show this text.
 
 REPORTS
-    --json <path>           Write a JSON report.
+    --json <path>           Write a JSON report (largest 50 findings).
+    --json-full             Make --json include every finding. Large: a scan of
+                            159,236 items produced a 112 MB document.
     --markdown <path>       Write a Markdown report.
     --html <path>           Write a self-contained HTML report.
 
@@ -136,6 +141,7 @@ let parse (args: string list) : Result<Options, string list> =
                 explicitDryRun <- true
                 loop options rest
             | "--help" | "-h" -> loop { options with Mode = Help } rest
+            | "--json-full" -> loop { options with JsonFull = true } rest
             | "--duplicates" -> loop { options with Duplicates = true } rest
             | "--large-files" -> loop { options with LargeFiles = true } rest
             | "--force" -> loop { options with Force = true } rest

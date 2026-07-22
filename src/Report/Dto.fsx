@@ -63,6 +63,14 @@ type ScanResultDto =
       /// since duplicate groups never contribute a deletion candidate.
       DuplicateWastedBytes: int64
       Categories: CategorySummaryDto list
+      /// How many findings this document actually carries. Equals TotalItems
+      /// only when the report is complete.
+      FindingsIncluded: int
+      /// True when Findings holds a subset. A truncated report that looked
+      /// complete would be the same class of defect as a silently partial
+      /// scan, so consumers are told outright rather than left to compare
+      /// counts.
+      FindingsTruncated: bool
       Findings: FindingDto list
       Duplicates: DuplicateGroupDto list
       Errors: string list

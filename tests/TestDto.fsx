@@ -34,6 +34,8 @@ let run () =
           PendingReviewBytes = 0L
           DuplicateWastedBytes = 0L
           Categories = [ { Category = "Logs"; ItemCount = 1; TotalBytes = 4096L; ReclaimableBytes = 4096L } ]
+          FindingsIncluded = 1
+          FindingsTruncated = false
           Findings = [ sampleFinding ]
           Duplicates = []
           Errors = []

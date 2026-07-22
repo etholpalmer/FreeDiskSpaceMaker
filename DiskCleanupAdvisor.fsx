@@ -83,7 +83,7 @@ let private runScan (options: Cli.Options) (config: Configuration.Config) (log: 
         let writeFailures =
             [ match options.JsonPath with
               | Some path ->
-                  match Report.Json.write path result with
+                  match Report.Json.writeWith options.JsonFull path result with
                   | Ok () -> log |> Logging.info (sprintf "wrote JSON report to %s" path)
                   | Error e -> yield e
               | None -> ()
