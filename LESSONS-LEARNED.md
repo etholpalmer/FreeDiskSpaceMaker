@@ -10,7 +10,7 @@
 - **Build:** none — script-only project, no `.fsproj`, no NuGet
 - **Test runner:** hand-rolled harness at `tests/TestFramework.fsx`, run via `dotnet fsi tests/Tests.fsx`
 - **Workflow:** subagent-driven development, 17 planned tasks, 24 commits
-- **Last Updated:** 2026-07-21
+- **Last Updated:** 2026-07-22
 
 ---
 
@@ -284,19 +284,6 @@ The first three were recoverable with better unit fixtures. The last three requi
 
 ---
 
-### 2026-07-21 — Time Machine snapshot reporting never ran against a live snapshot
-
-**Current State:** `src/Snapshots.fsx` parses `tmutil listlocalsnapshots /` and renders advice.
-
-**Limitation:** `tmutil` reported one snapshot early in the session and **zero** by the end — macOS thinned it. The live branch was therefore never exercised end-to-end. Verified synthetically using the exact observed name format (`com.apple.TimeMachine.2026-07-20-110340.local`): counts render, `tmutil` commands print, the disclaimer appears, empty list yields empty string.
-
-**Closing this gap requires:**
-1. Re-run `dotnet fsi DiskCleanupAdvisor.fsx -- --scan` when a snapshot exists and confirm the section appears — 5 minutes, opportunistic — **pending**
-
-**Priority:** Low — parsing is verified against the real format; only the live plumbing is unconfirmed.
-
----
-
 ## Compromises
 
 ### 2026-07-21 — Parallel traversal declined despite a 90-second scan
@@ -363,6 +350,27 @@ The first three were recoverable with better unit fixtures. The last three requi
 
 > Entries moved here when the underlying condition no longer applies.
 > Kept for historical context.
+
+### Archived 2026-07-22 — Time Machine snapshot reporting had never run against a live snapshot
+
+**Resolution:** No code change was needed — the branch was correct all along, and a live snapshot finally appeared. `tmutil listlocalsnapshots /` reported `com.apple.TimeMachine.2026-07-22-101319.local`, and the tool rendered:
+
+```
+1 Time Machine local snapshot(s) present, oldest from 2026-07-22.
+These can consume more space than everything listed above, and
+deleting files does not reclaim them. To inspect and remove:
+    tmutil listlocalsnapshots /
+    tmutil deletelocalsnapshots <date>
+This tool does not run those commands for you.
+```
+
+Count, date parsing, remedy commands and the disclaimer all rendered correctly against real `tmutil` output.
+
+**How it was closed is the interesting part.** Not by a test, and not by looking for it. The user removed Podman, freeing ~13 GB, and `df` did not move. Chasing that discrepancy found the snapshot pinning the freed blocks — which is exactly the situation this feature exists to explain. The gap closed because the tool's own advice turned out to be the answer to an unrelated question.
+
+**Original limitation:** `tmutil` reported one snapshot early in development and zero by the end — macOS thinned it — so the live branch could only be exercised synthetically, using the real name format (`com.apple.TimeMachine.2026-07-20-110340.local`) against `Snapshots.renderAdvice`.
+
+---
 
 ### Archived 2026-07-21 — Sparse files were reported at apparent size
 
