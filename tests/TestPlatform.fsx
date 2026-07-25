@@ -90,12 +90,30 @@ let run () =
         finally
             IO.Directory.Delete(root, true))
 
+    // Ground truth for the two tests below, both of which behave differently
+    // as root. Root ignores permission bits and is, by definition, elevated.
+    // The dev machine is never root, so these assumptions were invisible until
+    // the CI container (which runs as root) exercised them — the same
+    // environment-privileged blindness the permission-denial fix was about,
+    // now firing in the opposite direction. Derived from the effective uid via
+    // Environment.UserName, not from $USER, so it is not fooled by the shell.
+    let runningAsRoot =
+        (current () = Types.MacOS || current () = Types.Linux)
+        && Environment.UserName = "root"
+
     test "an unreadable directory surfaces PermissionDenied, never a silent empty" (fun () ->
         // With EnumerationOptions.IgnoreInaccessible = true, .NET returns an empty
         // result for a directory it cannot read. The walker would then record no
         // error, unreadableDirectoryCount would stay zero, and the "grant Full Disk
         // Access" hint would never fire — a partial scan presented as a complete one.
         // This test fails if that flag is ever flipped back.
+        if runningAsRoot then
+            // Root reads a chmod-000 directory regardless of its mode, so the
+            // denial this test asserts genuinely cannot occur. Skipping is
+            // correct, not a workaround: the invariant is real but unobservable
+            // for this user. A non-root leg (macos-arm64) still enforces it.
+            assertTrue true "skipped as root: permission bits do not deny root"
+        else
         let root = IO.Path.Combine(IO.Path.GetTempPath(), "dcadenied")
         let locked = IO.Path.Combine(root, "locked")
         let unlock () =
@@ -126,15 +144,16 @@ let run () =
 
     test "isElevated does not rely on the USER environment variable alone" (fun () ->
         // A bare $USER lookup is defeated by `env -u USER`. Environment.UserName
-        // resolves from the effective uid on Unix, so it survives that. This test
-        // pins the property rather than the implementation: under a normal
-        // non-root session the answer must be false, and must stay false even
-        // when USER is absent from the environment.
-        assertFalse (isElevated ()) "a normal session is not elevated"
+        // resolves from the effective uid on Unix, so it survives that. The
+        // property under test is not "always false" — it is "isElevated agrees
+        // with whether the process is actually root, even when $USER is unset".
+        // A non-root session expects false; a root container expects true.
+        assertEqual runningAsRoot (isElevated ()) "isElevated reflects the real privilege level"
         let original = Environment.GetEnvironmentVariable "USER"
         try
             Environment.SetEnvironmentVariable("USER", null)
-            assertFalse (isElevated ()) "still not elevated with USER unset"
+            assertEqual runningAsRoot (isElevated ())
+                "the answer is unchanged when USER is removed from the environment"
             assertTrue (Environment.UserName.Length > 0)
                 "Environment.UserName resolves without the USER variable"
         finally
