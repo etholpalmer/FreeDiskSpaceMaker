@@ -10,7 +10,7 @@
 - **Build:** none — script-only project, no `.fsproj`, no NuGet
 - **Test runner:** hand-rolled harness at `tests/TestFramework.fsx`, run via `dotnet fsi tests/Tests.fsx`
 - **Workflow:** subagent-driven development, 17 planned tasks, 24 commits
-- **Last Updated:** 2026-07-22
+- **Last Updated:** 2026-07-25
 
 ---
 
@@ -134,6 +134,38 @@ The first three were recoverable with better unit fixtures. The last three requi
 **Impact:** Task 9 exists solely to provide a DTO projection layer at a single boundary, with the rule *no field of any DTO may be a discriminated union*. Without it, the failure would have surfaced as a runtime crash during report writing, several tasks after the DUs were designed.
 
 **Active mitigation:** `tests/TestDto.fsx` serializes a full `ScanResultDto`; it fails immediately if a DU is introduced into a DTO field.
+
+---
+
+### 2026-07-25 — Environment-privileged blindness fires in *both* directions
+
+**Insight:** The dev machine's configuration hides the branches it cannot reach — and "too privileged" and "not privileged enough" are both hiding conditions. Earlier this project learned that Full Disk Access hid a permission-swallowing bug (the dev machine could always read, so the denial branch never ran). The reverse showed up the first time the suite ran in CI.
+
+**Discovery:** The local-ci Debian container runs as **root**, and two tests failed on their first Linux run — both correct code, both tests that silently assumed a *non-root* session. `chmod 000` then enumerate: root ignores permission bits and reads the directory, so the "denial surfaces" invariant genuinely cannot occur. And `isElevated()` correctly returned `true` because the process really is root, but the test asserted `false` ("a normal session"). The dev machine is never root, so neither assumption was ever exercised until a root environment ran the suite.
+
+**Design intent:** The tests pinned real invariants; they just baked in the tester's ambient privilege level as if it were universal. The fix makes both root-aware: skip the unobservable-as-root assertion (a non-root leg still enforces it), and assert `isElevated()` *agrees with the real privilege level* rather than assuming non-root.
+
+**Impact:** The cross-platform badge on the README stopped being an assertion and became a tested claim. The gate found this on run one — a second execution environment is worth more than a second assertion, because it changes what is *reachable*, not just what is *checked*.
+
+**Active mitigation:** commit `975bc8e`. `runningAsRoot` (derived from the effective uid via `Environment.UserName`) guards both tests; the CI gate now runs macOS (non-root) and Debian (root) on every push, so neither privilege branch can regress unseen.
+
+**Related:** Lesson — "Environment-privileged blindness" (the original, forward direction); Mistake — "Permission denial silently swallowed".
+
+---
+
+### 2026-07-25 — A status signal is only honest if something automated updates it
+
+**Insight:** A badge, a green check, or a "passing" label is a claim that some live mechanism stands behind it. When nothing does, it is a hand-typed constant that goes stale silently — the same failure class as the six inert CLI flags and the empty deletion journal, dressed as reassurance.
+
+**Discovery:** Twice in one session a static badge was declined for this reason. First a "tests: N passing" shield — not wired to CI, so it would lie the moment a test broke. Then a "CI: passing" badge — the project's CI is a *local* pre-push hook reporting to a local SQLite DB that GitHub cannot see, so a badge claiming CI status would describe a check it has no connection to. The four badges that shipped instead assert only stable facts (platforms, .NET 10, F# 9, trash-only deletion) that cannot drift into falsehood.
+
+**Design intent:** The whole project's ethic is "don't ship misleading signals." Applied to its own README, that rules out any badge whose truth is not continuously maintained. The test: *what updates this if the underlying fact changes?* No answer → don't display it as status.
+
+**Impact:** The honest alternative — GitHub Actions producing a real workflow-status badge — was offered with its real cost (Actions minutes, macOS at a 10× multiplier) rather than papered over. The user chose no CI badge; the point is the decision was surfaced, not that a badge was avoided.
+
+**Meta-pattern to hunt for:** *unbacked status signal*. Any indicator that reads as "current state" but has no live writer. Applies to dashboards, health endpoints, and README badges alike.
+
+**Related:** Lesson — "Adversarial probing beats assertion-counting" (both are about signals that look like evidence but aren't).
 
 ---
 
@@ -326,6 +358,22 @@ The first three were recoverable with better unit fixtures. The last three requi
 **Prevention going forward OR accepted recurrence:** **Accepted recurrence, permanently.** `src/Duplicates.fsx` does not reference `RiskEngine` at all, so duplicate groups cannot become `DeletionCandidate`s by construction. A test asserts `--delete` offers an identical item count with and without `--duplicates` (verified: 92,967 items both ways).
 
 **Revisit When:** never, unless the tool gains a way to prove a copy is unreferenced — which would require filesystem-level usage tracking it does not have.
+
+---
+
+### 2026-07-25 — Modified shared CI infrastructure to get per-test telemetry
+
+**Tradeoff:** The local-ci toolkit (`Platform/CI-CD`, shared by three projects) records per-test history only from TRX files, which only `dotnet test` emits. A `dotnet fsi` harness recorded leg-level PASS/FAIL and nothing finer. Getting per-test data required a change to the shared toolkit, not just this project.
+
+**Reason:** There was no project-local path. The recorder globs `*.trx` in a per-run results directory whose macOS path is timestamped and unknowable to a custom command; only the toolkit knows it. The fix — exporting `CI_RESULTS_DIR` to custom commands so a harness can drop its own TRX there — has to live in the shared `ci.sh`.
+
+**Impact:** One backward-compatible line per leg in shared infra. `dotnet test` ignores the new env var (it keeps using `--results-directory`), so the two other projects are unaffected — but they were not re-run to prove it. The claim rests on reasoning plus `bash -n`, not execution.
+
+**Prevention going forward OR accepted recurrence:** **Accepted, with the boundary stated.** Shared-infra changes for one project's benefit are acceptable *only when* backward compatibility is structural (here: an unread env var) rather than behavioral. The change was surfaced to the user as a decision before being made, and committed to the toolkit's own repo separately from the project. The residual risk — the other two projects' suites unverified — is documented rather than hidden.
+
+**Revisit When:** either other project's gate next runs; a green result confirms the compatibility claim empirically.
+
+**Related:** Lesson — "A status signal is only honest if something automated updates it" (the TRX work existed to make the trends signal real for this project).
 
 ---
 
