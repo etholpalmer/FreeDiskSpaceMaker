@@ -1,5 +1,10 @@
 # DiskCleanupAdvisor
 
+![Platforms: macOS | Linux | Windows](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-blue)
+![.NET 10](https://img.shields.io/badge/.NET-10-512BD4)
+![F# 9](https://img.shields.io/badge/F%23-9-378BBA)
+![Deletion: Trash only, never unlink](https://img.shields.io/badge/deletion-Trash%20only%2C%20never%20unlink-brightgreen)
+
 DiskCleanupAdvisor scans a macOS, Linux, or Windows machine for disposable
 files — caches, logs, build artifacts, crash reports, duplicates — and
 explains, item by item, why each one is (or is not) safe to remove. It never
