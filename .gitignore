@@ -4,3 +4,4 @@ bin/
 *.user
 reports/
 .superpowers/
+.ci-results/
