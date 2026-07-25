@@ -10,7 +10,11 @@ module TestFramework
 open System
 
 /// A single recorded test outcome.
-type private Outcome = { Suite: string; Name: string; Error: string option }
+type private Outcome =
+    { Suite: string
+      Name: string
+      Error: string option
+      DurationMs: float }
 
 let mutable private currentSuite = "(root)"
 let private outcomes = ResizeArray<Outcome>()
@@ -25,17 +29,23 @@ let suite (name: string) =
 
 /// Runs a single named test, capturing any assertion failure or exception.
 let test (name: string) (body: unit -> unit) =
+    let clock = Diagnostics.Stopwatch.StartNew()
+    let record (error: string option) =
+        clock.Stop()
+        outcomes.Add
+            { Suite = currentSuite; Name = name; Error = error
+              DurationMs = clock.Elapsed.TotalMilliseconds }
     try
         body ()
-        outcomes.Add { Suite = currentSuite; Name = name; Error = None }
+        record None
         printfn "  \027[32m✓\027[0m %s" name
     with
     | AssertionFailure msg ->
-        outcomes.Add { Suite = currentSuite; Name = name; Error = Some msg }
+        record (Some msg)
         printfn "  \027[31m✗\027[0m %s\n      %s" name msg
     | ex ->
         let msg = sprintf "unexpected %s: %s" (ex.GetType().Name) ex.Message
-        outcomes.Add { Suite = currentSuite; Name = name; Error = Some msg }
+        record (Some msg)
         printfn "  \027[31m✗\027[0m %s\n      %s" name msg
 
 /// Asserts structural equality, reporting both values on mismatch.
@@ -68,8 +78,50 @@ let assertError (result: Result<'a, 'e>) (message: string) : 'e =
     | Error e -> e
     | Ok v -> raise (AssertionFailure(sprintf "%s\n      expected Error, got Ok: %A" message v))
 
+/// XML-escapes text for a TRX attribute value.
+let private xmlAttr (value: string) : string =
+    value
+        .Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+        .Replace("\"", "&quot;")
+
+/// Formats milliseconds as the TRX duration string "HH:MM:SS.fffffff".
+let private trxDuration (ms: float) : string =
+    let span = TimeSpan.FromMilliseconds(max 0.0 ms)
+    span.ToString("hh\\:mm\\:ss\\.fffffff")
+
+/// Writes a TRX file when the CI toolkit points CI_RESULTS_DIR at a run's
+/// results directory. The toolkit records per-test rows by globbing *.trx
+/// there and reading each UnitTestResult's testName/outcome/duration; the
+/// dotnet fsi harness emits no TRX by default, so per-test history would
+/// otherwise be blank for this project. A no-op when the variable is unset,
+/// and any failure to write is swallowed — reporting must never gate on it.
+let private writeTrx () : unit =
+    match Environment.GetEnvironmentVariable "CI_RESULTS_DIR" with
+    | null | "" -> ()
+    | dir ->
+        try
+            IO.Directory.CreateDirectory dir |> ignore
+            let ns = "http://microsoft.com/schemas/VisualStudio/TeamTest/2010"
+            let sb = Text.StringBuilder()
+            sb.AppendLine "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" |> ignore
+            sb.AppendLine(sprintf "<TestRun xmlns=\"%s\">" ns) |> ignore
+            sb.AppendLine "  <Results>" |> ignore
+            for o in outcomes do
+                // "Suite / Name" is the stable identity used across legs, so
+                // divergence detection compares like with like.
+                let testName = xmlAttr (sprintf "%s / %s" o.Suite o.Name)
+                let outcome = if o.Error.IsSome then "Failed" else "Passed"
+                sb.AppendLine(
+                    sprintf "    <UnitTestResult testName=\"%s\" outcome=\"%s\" duration=\"%s\" />"
+                        testName outcome (trxDuration o.DurationMs)) |> ignore
+            sb.AppendLine "  </Results>" |> ignore
+            sb.AppendLine "</TestRun>" |> ignore
+            IO.File.WriteAllText(IO.Path.Combine(dir, "harness.trx"), sb.ToString())
+        with _ -> ()
+
 /// Prints a summary and returns a process exit code (0 = all passed).
 let report () : int =
+    writeTrx ()
     let failed = outcomes |> Seq.filter (fun o -> o.Error.IsSome) |> Seq.toList
     printfn "\n%s" (String.replicate 60 "─")
     if List.isEmpty failed then
