@@ -214,9 +214,47 @@ what is normally an occasional, not repeated, tool run.
 ## Development
 
 ```bash
-dotnet fsi tests/Tests.fsx   # run the full test suite
+dotnet fsi tests/Tests.fsx   # run the full test suite (no build step)
 ```
 
-No file under `src/` or `tests/` contains a `#load` directive except
-`tests/Tests.fsx` and `DiskCleanupAdvisor.fsx` — those two are the only load
-order owners in the project.
+There is no `.fsproj`, no NuGet restore, and no build — the test suite is a
+hand-rolled harness (`tests/TestFramework.fsx`) run directly by `dotnet fsi`.
+A green run prints `N passed` and exits `0`.
+
+### Invariants a change must preserve
+
+These are enforced mechanically, not by convention. A change that breaks one
+should fail the suite or the audits below before it ever reaches review.
+
+- **Trash only, never unlink.** No file under `src/` contains a `File.Delete`,
+  `Directory.Delete`, or any other unlink call — every removal is a relocation
+  into the platform Trash. Audit: `grep -rn 'File\.Delete\|Directory\.Delete'
+  src/` matches only the doc comment in `src/Cleaner.fsx` that states the rule.
+- **Two load-order owners.** No file under `src/` or `tests/` contains a
+  `#load` directive except `tests/Tests.fsx` and `DiskCleanupAdvisor.fsx`.
+  `#load` is not idempotent in `dotnet fsi` — a file reached through two
+  directives is evaluated twice — so those two files are the only place load
+  order is declared. Audit: `grep -l '^#load' src/*.fsx src/Report/*.fsx
+  tests/*.fsx DiskCleanupAdvisor.fsx` must list exactly those two.
+- **Privilege-dependent tests must be root-aware.** The CI Linux leg runs as
+  root, where permission bits do not deny and `isElevated ()` is genuinely
+  true. A test that asserts a permission denial or a non-root session must
+  guard on `runningAsRoot` (see `tests/TestPlatform.fsx`) or it will pass on
+  the developer's macOS machine and fail in CI.
+
+### CI gate
+
+Pushing is gated by a local pre-push hook that runs the suite on **two
+platforms** — macOS (arm64, non-root) and Debian (arm64, in a container, root)
+— and blocks the push unless both pass. The Linux leg needs Docker running;
+without it that leg is skipped, not silently passed.
+
+The gate is configured in `ci.config` (`TEST_CMD`, `LEGS`) and installed via
+the `local-ci` toolkit. Escape hatches (`CI_SKIP=1`, `git push --no-verify`)
+exist but defeat the two-platform guarantee — the cross-platform badge above
+is only meaningful because both legs actually run.
+
+The design rationale behind these invariants — why trash-only, why the
+`#load` rule, why both platforms — is recorded in
+[LESSONS-LEARNED.md](LESSONS-LEARNED.md), which doubles as the project's
+engineering journal.
