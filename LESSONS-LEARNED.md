@@ -169,6 +169,22 @@ The first three were recoverable with better unit fixtures. The last three requi
 
 ---
 
+### 2026-10-30 — Two human-facing docs describing one tool drift apart; verify docs against source, not against each other
+
+**Insight:** The project had two prose descriptions of the same CLI — `README.md` (quick reference) and `docs/user-guide.html` (the manual). The guide, written later, documented behaviour the README never caught up to: the five-level risk model, `--json-full` and the default JSON 50-largest cap (`findingsTruncated: true`), the `findingsMinSizeBytes` config key, the three restore artifacts, and the Windows `--delete` refusal. Neither doc was *wrong*; they had simply drifted, and a reader's picture depended on which one they opened.
+
+**Discovery:** A request to "update the README to reflect critical parts of the user-guide" forced a three-way comparison — README vs guide vs source. The guide turned out closer to source than the README on five flags/keys. The reconciliation was done by grepping `src/Cli.fsx` and `src/Configuration.fsx` for each claim (`--json-full`/`JsonFull`, `FindingsMinSizeBytes`) before writing it, not by copying the guide's wording — the guide is secondary evidence, the source is primary.
+
+**Design intent:** The duplication is deliberate and worth keeping — a terminal-first README and a browsable HTML manual serve different moments. The cost of that choice is drift, and the discipline that pays for it is: when any doc makes a factual claim about a flag, default, or behaviour, the claim is checked against source at write time, and the authoritative list is always `--help` (the README and guide both now say so in their footers).
+
+**Meta-pattern to hunt for:** *parallel-doc drift* — two or more human-facing documents that independently restate the same machine-checkable facts. Whenever one is edited, the others are silently stale until something reconciles them. There is no automated binding here (see Gap below), so the active discipline is the grep-against-source check, and a periodic three-way diff when either doc changes materially.
+
+**Active mitigation (partial):** none automated yet. The CI gate tests code, not doc/source agreement. Interim discipline only: grep source for every documented flag/key before asserting it, and treat `dotnet fsi DiskCleanupAdvisor.fsx -- --help` as the single source of truth both docs defer to.
+
+**Related:** Lesson — "A status signal is only honest if something automated updates it" (both are about claims with no live writer behind them); Gap — "No check binds the docs to the actual flag set" (below).
+
+---
+
 ## Mistakes & Fixes
 
 ### 2026-07-21 — Permission denial silently swallowed
@@ -322,6 +338,26 @@ The first three were recoverable with better unit fixtures. The last three requi
 
 ## Solution Gaps
 
+### 2026-10-30 — No check binds the docs to the actual flag set
+
+**Current State:** `README.md` and `docs/user-guide.html` describe the CLI's flags, defaults, and config keys in prose. The CI gate runs the test suite but asserts nothing about whether those docs match `src/Cli.fsx` / `src/Configuration.fsx`. Agreement is maintained by hand (grep-against-source at write time).
+
+**Limitation:** A flag added to `Cli.fsx` without a doc edit, or a default changed in `Configuration.fsx`, leaves both docs silently stale. This already happened once (see Lesson — "parallel-doc drift"): the guide documented five things the README lacked.
+
+**Ideal Solution:** A test that parses the flag names out of `Cli.fsx`'s usage text (and the config keys out of `Configuration.fsx`'s reader) and asserts every one appears in both docs, failing the suite on an undocumented flag. Docs would then drift at most until the next push.
+
+**Closing this gap requires:**
+1. Extract the canonical flag list — reuse the existing `--help` usage string rather than re-parsing argv handling (~an hour). — pending
+2. Extract the config-key list from the JSON reader in `Configuration.fsx` (~an hour). — pending
+3. A test that greps `README.md` and `docs/user-guide.html` for each name and reports any missing (~a couple of hours). — pending
+4. Decide the direction: fail on a flag absent from docs; probably *warn* on doc text absent from source, since prose legitimately says more than the flag list (~half-hour of judgement). — pending
+
+**Active mitigation:** the write-time discipline from the parallel-doc-drift lesson — grep source for each claim, treat `--help` as source of truth. Reduces but does not close the drift window.
+
+**Priority:** Low — the tool's flag surface is small and changes rarely; the manual discipline has held so far. Worth doing if the flag set starts churning.
+
+**Related:** Lesson — "parallel-doc drift" (2026-10-30).
+
 ## Compromises
 
 ### 2026-10-30 — Remote changed between sessions; a plain `git push` targets an unreachable LAN box
@@ -335,6 +371,8 @@ The first three were recoverable with better unit fixtures. The last three requi
 **Prevention going forward OR accepted recurrence:** **Accepted recurrence.** The mechanism is explicitness: always `git push origin main`, never bare `git push`, in this repo until the user settles the default. Stated here so the next session does not re-diagnose the timeout from scratch.
 
 **Revisit When:** the user picks a single canonical remote, or sets `branch.main.pushRemote`.
+
+**Updated 2026-10-30 (repo-rename variant):** A later push to `origin` succeeded but the remote replied `remote: This repository moved. Please use the new location: https://github.com/etholpalmer/FreeDiskSpaceMaker.git` — GitHub had renamed `MacDiskDeleter` → `FreeDiskSpaceMaker` and was serving the push via a redirect. The push works, but relying on the redirect is the same "remote changed between sessions" hazard in a second form (renamed, not relocated). Fix applied: `git remote set-url origin https://github.com/etholpalmer/FreeDiskSpaceMaker.git`; a `--dry-run` push then reported `Everything up-to-date` with no redirect notice. The `ci` LAN remote still points at the old `MacDiskDeleter` name on the Gitea box and was left untouched. Same accepted-recurrence mechanism: trust the remote's own "moved"/"not found" message over the local config, and re-point rather than lean on redirects.
 
 **Related:** Mistake — "git push returned Repository not found".
 
