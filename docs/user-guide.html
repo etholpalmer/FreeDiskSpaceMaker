@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DiskCleanupAdvisor — User Guide</title>
+<style>
+  :root {
+    /* Risk palette — the same semantics the tool prints, used as the design spine. */
+    --safe:          #1f7a4d;
+    --probably:      #2b6cb0;
+    --review:        #9a6a00;
+    --dangerous:     #8a2be2;
+    --never:         #a02020;
+
+    --bg:      #fbfaf7;
+    --surface: #ffffff;
+    --raised:  #f4f2ec;
+    --ink:     #20242a;
+    --muted:   #5c6470;
+    --faint:   #8a919c;
+    --line:    #e4e0d8;
+    --accent:  #1f7a4d;
+    --warn-bg: #fff7e6;
+    --warn-line:#d99a00;
+    --danger-bg:#fdecec;
+    --danger-line:#c0392b;
+    --code-bg: #1c2128;
+    --code-ink:#e6edf3;
+    --code-dim:#8b949e;
+
+    --maxw: 54rem;
+    --radius: 10px;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#14161a; --surface:#1b1e24; --raised:#20242b; --ink:#e8e8ea;
+      --muted:#9aa0a6; --faint:#6b7178; --line:#2a2d33; --accent:#4fd18b;
+      --warn-bg:#2a220f; --warn-line:#9a6a00; --danger-bg:#2a1414; --danger-line:#a02020;
+      --safe:#4fd18b; --probably:#5aa6e8; --review:#d9a93a; --dangerous:#b57be8; --never:#e06666;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--sans); font-size: 17px; line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: var(--maxw); margin: 0 auto; padding: 0 1rem 6rem; }
+
+  /* ── Masthead ───────────────────────────────── */
+  header.masthead {
+    max-width: var(--maxw); margin: 0 auto; padding: 3.5rem 1rem 1.5rem;
+  }
+  .eyebrow {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--faint); margin: 0 0 .6rem;
+  }
+  h1 {
+    font-family: var(--serif); font-weight: 600; letter-spacing: -0.01em;
+    font-size: clamp(2.4rem, 1.2rem + 4vw, 3.8rem); line-height: 1.02;
+    margin: 0 0 .5rem;
+  }
+  .lede { font-size: 1.15rem; color: var(--muted); margin: 0; max-width: 42rem; }
+
+  /* ── The one guarantee ──────────────────────── */
+  .guarantee {
+    max-width: var(--maxw); margin: 1.75rem auto 0; padding: 0 1rem;
+  }
+  .guarantee .inner {
+    border: 1px solid var(--line); border-left: 4px solid var(--safe);
+    background: var(--surface); border-radius: var(--radius);
+    padding: 1.1rem 1.3rem; display: flex; gap: .9rem; align-items: flex-start;
+  }
+  .guarantee .mark {
+    color: var(--safe); font-size: 1.5rem; line-height: 1.3; flex: none;
+  }
+  .guarantee p { margin: 0; }
+  .guarantee strong { font-weight: 650; }
+
+  /* ── Nav ────────────────────────────────────── */
+  nav.toc {
+    max-width: var(--maxw); margin: 2.5rem auto 0; padding: 1.2rem 1.3rem;
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  }
+  nav.toc h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .1em;
+    color: var(--faint); margin: 0 0 .8rem; }
+  nav.toc ol { margin: 0; padding: 0; list-style: none; columns: 2; column-gap: 2rem; }
+  @media (max-width: 34rem) { nav.toc ol { columns: 1; } }
+  nav.toc li { margin: 0 0 .35rem; font-size: .95rem; break-inside: avoid; }
+  nav.toc a { color: var(--ink); text-decoration: none; border-bottom: 1px solid transparent; }
+  nav.toc a:hover { border-bottom-color: var(--accent); color: var(--accent); }
+
+  section { margin-top: 3.2rem; scroll-margin-top: 1rem; }
+  h2.sec {
+    font-family: var(--serif); font-size: 1.7rem; font-weight: 600;
+    letter-spacing: -0.01em; margin: 0 0 .3rem; padding-bottom: .4rem;
+    border-bottom: 2px solid var(--line);
+  }
+  h2.sec .num { color: var(--faint); font-family: var(--mono); font-size: 1rem;
+    margin-right: .6rem; font-weight: 400; }
+  h3 { font-size: 1.15rem; margin: 1.8rem 0 .5rem; }
+  p { margin: .8rem 0; }
+  a { color: var(--accent); }
+
+  code {
+    font-family: var(--mono); font-size: .88em;
+    background: var(--raised); border: 1px solid var(--line);
+    border-radius: 5px; padding: .08em .38em;
+  }
+  pre {
+    background: var(--code-bg); color: var(--code-ink); font-family: var(--mono);
+    font-size: .86rem; line-height: 1.55; border-radius: var(--radius);
+    padding: 1rem 1.1rem; overflow-x: auto; margin: 1rem 0;
+  }
+  pre code { background: none; border: none; padding: 0; color: inherit; font-size: inherit; }
+  pre .c { color: var(--code-dim); } /* comment */
+  pre .p { color: #7ee787; }         /* prompt / safe */
+  pre .f { color: #79c0ff; }         /* flag */
+
+  /* ── Callouts ───────────────────────────────── */
+  .callout {
+    border: 1px solid var(--line); border-left: 4px solid var(--muted);
+    background: var(--surface); border-radius: var(--radius);
+    padding: .9rem 1.1rem; margin: 1.2rem 0;
+  }
+  .callout .label {
+    font-family: var(--mono); font-size: .7rem; letter-spacing: .12em;
+    text-transform: uppercase; font-weight: 600; display: block; margin-bottom: .35rem;
+  }
+  .callout p:first-of-type { margin-top: 0; }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout.warn   { border-left-color: var(--warn-line); background: var(--warn-bg); }
+  .callout.warn .label { color: var(--warn-line); }
+  .callout.danger { border-left-color: var(--danger-line); background: var(--danger-bg); }
+  .callout.danger .label { color: var(--danger-line); }
+  .callout.tip .label { color: var(--accent); }
+  .callout.tip { border-left-color: var(--accent); }
+
+  /* ── Footgun cards ──────────────────────────── */
+  .footgun {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 1.1rem 1.3rem; margin: 1rem 0;
+  }
+  .footgun h3 { margin: 0 0 .4rem; font-size: 1.08rem; display: flex; gap: .55rem; align-items: baseline; }
+  .footgun h3 .fg-num {
+    font-family: var(--mono); font-size: .78rem; color: #fff; background: var(--danger-line);
+    border-radius: 5px; padding: .08em .5em; flex: none; align-self: center;
+  }
+  .footgun p { margin: .5rem 0 0; font-size: .97rem; }
+  .footgun .fix { font-size: .92rem; color: var(--muted); margin-top: .55rem; }
+  .footgun .fix strong { color: var(--ink); }
+
+  /* ── Risk table ─────────────────────────────── */
+  table { width: 100%; border-collapse: collapse; margin: 1.2rem 0; font-size: .95rem; }
+  th, td { text-align: left; padding: .6rem .7rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; color: var(--faint); }
+  .pill {
+    font-family: var(--mono); font-size: .78rem; font-weight: 600;
+    padding: .12rem .5rem; border-radius: 5px; color: #fff; white-space: nowrap;
+  }
+  .pill.safe { background: var(--safe); }
+  .pill.probably { background: var(--probably); }
+  .pill.review { background: var(--review); }
+  .pill.dangerous { background: var(--dangerous); }
+  .pill.never { background: var(--never); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+
+  /* ── Example blocks ─────────────────────────── */
+  .example {
+    margin: 1.4rem 0; border: 1px solid var(--line); border-radius: var(--radius);
+    overflow: hidden; background: var(--surface);
+  }
+  .example .ex-head {
+    display: flex; gap: .7rem; align-items: baseline;
+    padding: .7rem 1rem; border-bottom: 1px solid var(--line); background: var(--raised);
+  }
+  .example .ex-n {
+    font-family: var(--mono); font-weight: 700; color: var(--accent); font-size: .9rem; flex: none;
+  }
+  .example .ex-title { font-weight: 600; font-size: 1rem; }
+  .example .ex-body { padding: .3rem 1rem 1rem; }
+  .example pre { margin: .9rem 0 .6rem; }
+  .example p { font-size: .95rem; margin: .5rem 0 0; }
+
+  .gate-flow { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; margin: 1.2rem 0; }
+  .gate {
+    flex: 1 1 10rem; border: 1px solid var(--line); border-radius: var(--radius);
+    padding: .8rem 1rem; background: var(--surface);
+  }
+  .gate .g-n { font-family: var(--mono); font-size: .72rem; color: var(--faint); }
+  .gate .g-t { font-weight: 650; display: block; margin: .15rem 0 .3rem; }
+  .gate .g-d { font-size: .88rem; color: var(--muted); }
+  .arrow { color: var(--faint); font-size: 1.4rem; flex: none; }
+  @media (max-width: 40rem) { .arrow { transform: rotate(90deg); align-self: center; } }
+
+  footer {
+    max-width: var(--maxw); margin: 4rem auto 0; padding: 1.5rem 1rem;
+    border-top: 1px solid var(--line); color: var(--faint); font-size: .86rem;
+  }
+  footer a { color: var(--muted); }
+  .kbd { font-family: var(--mono); font-size: .82em; background: var(--raised);
+    border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: .05em .4em; }
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <p class="eyebrow">User Guide · F# · macOS / Linux / Windows</p>
+  <h1>DiskCleanupAdvisor</h1>
+  <p class="lede">Finds disposable files on a developer machine, explains item by item why each is
+  (or is not) safe to remove, and — only when you explicitly ask — moves the safe ones to the Trash.</p>
+</header>
+
+<div class="guarantee">
+  <div class="inner">
+    <span class="mark" aria-hidden="true">✓</span>
+    <p><strong>The one thing to remember:</strong> this tool moves files to the Trash and
+    <strong>never deletes them</strong>. A scan with no arguments only reports. Nothing is modified
+    unless you pass <code>--delete</code> and then type <code>yes</code>. Even then, items go to the
+    Trash with a generated restore script — and your disk space is reclaimed only when
+    <em>you</em> empty the Trash yourself.</p>
+  </div>
+</div>
+
+<main>
+
+<nav class="toc" aria-label="Contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#what">1 · What it is</a></li>
+    <li><a href="#install">2 · Requirements &amp; install</a></li>
+    <li><a href="#quickstart">3 · Quick start</a></li>
+    <li><a href="#risk">4 · Risk levels</a></li>
+    <li><a href="#gates">5 · The three-gate safety model</a></li>
+    <li><a href="#footguns">6 · Warnings &amp; footguns</a></li>
+    <li><a href="#examples">7 · Ten worked examples</a></li>
+    <li><a href="#flags">8 · Flag reference</a></li>
+    <li><a href="#config">9 · Configuration file</a></li>
+    <li><a href="#reports">10 · Reports</a></li>
+    <li><a href="#restore">11 · Restoring</a></li>
+    <li><a href="#rules">12 · Adding a rule</a></li>
+  </ol>
+</nav>
+
+<!-- 1 ─────────────────────────────────────────── -->
+<section id="what">
+  <h2 class="sec"><span class="num">01</span>What it is</h2>
+  <p>DiskCleanupAdvisor is a single F# script, run with <code>dotnet fsi</code>. It walks your home
+  directory and the well-known cache locations a developer machine accumulates — package-manager
+  caches, browser caches, build artifacts, logs, crash reports, duplicates, large files — and
+  produces a report grouped by category, each finding tagged with a risk level and a plain-English
+  reason.</p>
+  <p>It is deliberately conservative. It understands the difference between a regenerable cache and
+  the data a running application depends on, and it refuses to treat the second as the first. Its
+  defining constraint, which every design decision is subordinate to, is that it must be
+  <em>impossible to lose data by using it</em>.</p>
+  <p>There is no build step, no NuGet restore, and no third-party dependency — only the .NET base
+  class library.</p>
+</section>
+
+<!-- 2 ─────────────────────────────────────────── -->
+<section id="install">
+  <h2 class="sec"><span class="num">02</span>Requirements &amp; install</h2>
+  <p>You need the <strong>.NET 10 SDK</strong> (F# 9 and <code>dotnet fsi</code> ship with it).
+  The tool runs on macOS, Linux, and Windows via <code>RuntimeInformation</code> platform detection,
+  though the macOS rule catalogue is the most complete; Linux and Windows catalogues are seeded and
+  grow as they can be verified on real machines of those platforms.</p>
+  <p>There is nothing to install beyond cloning the repository. From the project root:</p>
+  <pre><code><span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --help</span></code></pre>
+  <p>The <code>--</code> separates <code>dotnet fsi</code>'s own arguments from the script's. Every
+  example below includes it.</p>
+  <div class="callout tip">
+    <span class="label">macOS: grant Full Disk Access</span>
+    <p>Without it, macOS silently blocks the tool from reading parts of <code>~/Library</code>, and
+    the scan is incomplete. The tool detects this and reports how many directories it could not read —
+    see footgun&nbsp;#5. Grant access to your terminal under <strong>System&nbsp;Settings → Privacy &amp;
+    Security → Full Disk Access</strong>.</p>
+  </div>
+</section>
+
+<!-- 3 ─────────────────────────────────────────── -->
+<section id="quickstart">
+  <h2 class="sec"><span class="num">03</span>Quick start</h2>
+  <p>A plain scan is the default and is completely safe — it reads and reports, and cannot modify
+  anything:</p>
+  <pre><code><span class="c"># Dry run (default). Reports only. Nothing is touched.</span>
+<span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --scan</span>
+
+<span class="c"># Write a browsable HTML report alongside the console output.</span>
+<span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --scan --html report.html</span>
+
+<span class="c"># When you have reviewed the report and want to act:</span>
+<span class="c"># prompts first, moves only Safe-rated items to the Trash.</span>
+<span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --delete</span></code></pre>
+  <p>Read the report, decide, then — if you want — delete. The tool never gets ahead of you.</p>
+</section>
+
+<!-- 4 ─────────────────────────────────────────── -->
+<section id="risk">
+  <h2 class="sec"><span class="num">04</span>Risk levels</h2>
+  <p>Every finding carries one of five risk levels. Only the first is ever removed automatically;
+  the second only with <code>--force</code>. The rest are reported for your judgement and are never
+  deleted by the tool.</p>
+  <table>
+    <thead><tr><th>Level</th><th>Icon</th><th>Meaning</th><th>Auto-deleted?</th></tr></thead>
+    <tbody>
+      <tr><td><span class="pill safe">Safe</span></td><td>✓</td>
+        <td>Regenerable, no user data. The producing tool recreates it on demand.</td>
+        <td>Yes, with <code>--delete</code></td></tr>
+      <tr><td><span class="pill probably">ProbablySafe</span></td><td>○</td>
+        <td>Regenerable, but an application may need to re-download it, or it may hold a locally-built artifact.</td>
+        <td>Only with <code>--delete --force</code></td></tr>
+      <tr><td><span class="pill review">Review</span></td><td>?</td>
+        <td>Requires human judgement — may be application state, documents, or a copy something depends on.</td>
+        <td>Never</td></tr>
+      <tr><td><span class="pill dangerous">Dangerous</span></td><td>!</td>
+        <td>Deletion is likely to break something.</td>
+        <td>Never</td></tr>
+      <tr><td><span class="pill never">NeverDelete</span></td><td>✕</td>
+        <td>Protected. The tool will never remove it, and no flag overrides this.</td>
+        <td>Never</td></tr>
+    </tbody>
+  </table>
+  <div class="callout">
+    <span class="label">Why duplicates and <code>node_modules</code> are only <em>Review</em></span>
+    <p>Identical bytes do not make a copy disposable — the second copy may be the one a running
+    program references. And <code>node_modules</code> is reinstallable only if the project is still
+    wanted and its lockfile is intact. The tool reports both, prominently, but will not remove them
+    for you.</p>
+  </div>
+</section>
+
+<!-- 5 ─────────────────────────────────────────── -->
+<section id="gates">
+  <h2 class="sec"><span class="num">05</span>The three-gate safety model</h2>
+  <p>Before any file is moved, it must pass <strong>all three</strong> independent gates. Each gate
+  can only reject — none can approve on its own.</p>
+  <div class="gate-flow">
+    <div class="gate"><span class="g-n">GATE 1</span><span class="g-t">Rule assertion</span>
+      <span class="g-d">A matching rule must mark the path <span class="pill safe">Safe</span> and deletable.
+      Absent a rule, the answer is no.</span></div>
+    <span class="arrow" aria-hidden="true">→</span>
+    <div class="gate"><span class="g-n">GATE 2</span><span class="g-t">Allowlist anchoring</span>
+      <span class="g-d">The path must be a strict descendant of the rule's resolved root, checked after
+      normalisation — so <code>../</code> escapes resolve first.</span></div>
+    <span class="arrow" aria-hidden="true">→</span>
+    <div class="gate"><span class="g-n">GATE 3</span><span class="g-t">Denylist veto</span>
+      <span class="g-d">A hardcoded protected set — Documents, Desktop, /System, anything inside a
+      <code>.git</code> directory — checked last. It outranks <code>--force</code> and config overrides.</span></div>
+  </div>
+  <p>The veto has <strong>no bypass flag</strong>. Configuration risk overrides can only <em>raise</em>
+  a rule's risk, never lower it; an override that tries to lower risk is rejected as a configuration
+  error. Symlinks are never followed, and the tool refuses to run as root unless you pass
+  <code>--allow-root</code>.</p>
+  <div class="callout tip">
+    <span class="label">Built so the dangerous case is unreachable, not just guarded</span>
+    <p>Internally, the only value that reaches the deletion step is one the risk engine itself minted
+    after all three gates passed. There is no code path that hands an arbitrary path to the deleter —
+    "delete this path I chose" is simply not expressible. That is a stronger guarantee than a runtime
+    check you have to remember to write.</p>
+  </div>
+</section>
+
+<!-- 6 ─────────────────────────────────────────── -->
+<section id="footguns">
+  <h2 class="sec"><span class="num">06</span>Warnings &amp; footguns</h2>
+  <p>None of these can cause data loss on their own — the safety model prevents that — but each is a
+  place where the tool's honest behaviour can surprise you if you expect something else.</p>
+
+  <div class="footgun">
+    <h3><span class="fg-num">1</span>The Trash is not emptied, so space is not freed yet</h3>
+    <p><code>--delete</code> <em>moves</em> files into the Trash. Your free space does not change until
+    you empty the Trash yourself. A report that says "Moved 15 GB to the Trash" has reclaimed nothing
+    on disk — it has made 15 GB <em>eligible</em> to be reclaimed.</p>
+    <p class="fix"><strong>Do:</strong> empty the Trash in Finder when you are satisfied. That — not the
+    tool — is the irreversible step.</p>
+  </div>
+
+  <div class="footgun">
+    <h3><span class="fg-num">2</span>Emptying the Trash is the point of no return</h3>
+    <p>Everything the tool does is reversible <em>until</em> you empty the Trash. The tool will never
+    empty it for you, by design. Once you do, the restore script (footgun&nbsp;#9) can no longer bring
+    anything back.</p>
+    <p class="fix"><strong>Do:</strong> skim the Trash before emptying, especially on your first run.</p>
+  </div>
+
+  <div class="footgun">
+    <h3><span class="fg-num">3</span>Sparse files: the real size is smaller than it looks</h3>
+    <p>Docker and Podman disk images are <em>sparse</em> — their logical length is far larger than the
+    blocks they actually occupy. The tool reports <strong>allocated</strong> size (what you reclaim),
+    not apparent size. A <code>Docker.raw</code> that macOS lists as 64 GB may really be 16 GB on disk,
+    and the tool will say 16 GB. This is correct, but it can look like an under-count if you compare
+    against <code>ls -l</code>.</p>
+    <p class="fix"><strong>Know:</strong> <code>du -h &lt;file&gt;</code> agrees with the tool;
+    <code>ls -l</code> shows the inflated apparent size.</p>
+  </div>
+
+  <div class="footgun">
+    <h3><span class="fg-num">4</span>Time Machine snapshots pin freed space</h3>
+    <p>On macOS, a local Time Machine snapshot can hold on to the blocks you just freed, so emptying
+    the Trash appears to reclaim nothing. The tool reports any snapshots it finds and prints the
+    <code>tmutil</code> commands — but it will not run them.</p>
+    <p class="fix"><strong>Do:</strong> if free space does not move after emptying the Trash, run
+    <code>tmutil listlocalsnapshots /</code> then <code>tmutil deletelocalsnapshots &lt;date&gt;</code>.</p>
+  </div>
+
+  <div class="footgun">
+    <h3><span class="fg-num">5</span>A partial scan is not a complete one</h3>
+    <p>Without Full Disk Access on macOS, whole subtrees are unreadable and silently excluded by the
+    OS. The tool surfaces this — "<em>N directories were unreadable</em>" — rather than pretending the
+    scan was total. The reclaimable figure is a <strong>floor</strong>, not a ceiling, until access is
+    granted.</p>
+    <p class="fix"><strong>Do:</strong> grant Full Disk Access (section&nbsp;2) for a complete picture.</p>
+  </div>
+
+  <div class="footgun">
+    <h3><span class="fg-num">6</span>Your biggest consumers are often <em>not</em> deletable</h3>
+    <p>VM images, iOS Simulator device data, and <code>node_modules</code> are frequently the largest
+    things on a dev machine, and the tool rates them <span class="pill review">Review</span> — reported
+    but never auto-removed. The headline "reclaimable" number is almost always smaller than the headline
+    "pending review" number, and that is correct.</p>
+    <p class="fix"><strong>Do:</strong> use the right purpose-built tool for those —
+    <code>docker system prune</code>, <code>xcrun simctl delete unavailable</code>, or removing a VM
+    machine explicitly. (See footgun&nbsp;#10 for a Podman trap.)</p>
+  </div>
+
+  <div class="footgun">
+    <h3><span class="fg-num">7</span><code>--force</code> is narrow, and the veto still wins</h3>
+    <p><code>--force</code> widens automatic deletion by exactly one level — it also permits
+    <span class="pill probably">ProbablySafe</span>. It does <strong>not</strong> touch Review,
+    Dangerous, or NeverDelete, and it does <strong>not</strong> bypass the protected-path veto. There is
+    no flag that deletes "everything".</p>
+    <p class="fix"><strong>Know:</strong> if you expected <code>--force</code> to clear Review items,
+    it will not. That is deliberate.</p>
+  </div>
+
+  <div class="footgun">
+    <h3><span class="fg-num">8</span><code>--delete</code> alone takes the <em>whole</em> Safe set</h3>
+    <p>Filters like <code>--age</code> and <code>--min-size</code> narrow what is reported — and
+    therefore what <code>--delete</code> acts on. <code>--delete</code> with no filters moves every
+    Safe-rated item. If you meant "only caches older than 90 days", you must say so; the tool will not
+    assume a narrower intent than the flags express.</p>
+    <p class="fix"><strong>Do:</strong> combine filters with <code>--delete</code>, e.g.
+    <code>--delete --age 90</code>, when you want a narrower set. The confirmation prompt shows the
+    count and total size before you commit.</p>
+  </div>
+
+  <div class="footgun">
+    <h3><span class="fg-num">9</span>A file that changed since the scan is skipped, not moved</h3>
+    <p>Between the scan and your <code>yes</code>, you might sit at the prompt for a while. Immediately
+    before each move the tool re-checks the file: if its size, type, or link status changed, or it is
+    now inside a protected location, it is skipped and reported as a failure — never moved blindly.</p>
+    <p class="fix"><strong>Know:</strong> "N items could not be moved" after a delete is usually this —
+    something wrote to a cache while you were deciding.</p>
+  </div>
+
+  <div class="footgun">
+    <h3><span class="fg-num">10</span>Podman: <code>system prune</code> will not reclaim the machine image</h3>
+    <p>If the tool flags a Podman machine image, note that <code>podman system prune</code> cleans up
+    <em>inside</em> the guest VM — it does nothing while the machine is stopped, and even a successful
+    prune leaves the host file the same size, because freeing blocks inside a sparse image does not
+    return them to macOS. The directory also survives a Homebrew/Desktop uninstall, because the official
+    <code>.pkg</code> installs to <code>/opt/podman</code>.</p>
+    <p class="fix"><strong>Do:</strong> reclaim it with <code>podman machine rm &lt;name&gt;</code>, which
+    destroys the guest filesystem — genuinely irreversible, unlike anything this tool does.</p>
+  </div>
+
+  <div class="footgun">
+    <h3><span class="fg-num">11</span>The default JSON report is capped; <code>--json-full</code> is enormous</h3>
+    <p><code>--json</code> writes the 50 largest findings and marks the document truncated
+    (<code>findingsTruncated: true</code>) while keeping every aggregate total accurate. A full scan has
+    well over 100,000 findings, so <code>--json-full</code> can produce a 100&nbsp;MB+ file.</p>
+    <p class="fix"><strong>Do:</strong> use <code>--json</code> for a quick machine-readable summary;
+    reach for <code>--json-full</code> only when you genuinely need every row.</p>
+  </div>
+
+  <div class="footgun">
+    <h3><span class="fg-num">12</span>Windows refuses <code>--delete</code> rather than guessing</h3>
+    <p>Moving to the Recycle Bin needs a platform call this script-only tool does not make, and the only
+    dependency-free fallback would be an irreversible <code>unlink</code> — which would defeat the whole
+    safety model. So on Windows, <code>--delete</code> returns an error instead of degrading to something
+    unsafe. Scanning and reporting work normally.</p>
+    <p class="fix"><strong>Know:</strong> this is a refusal on purpose, not a bug.</p>
+  </div>
+</section>
+
+<!-- 7 ─────────────────────────────────────────── -->
+<section id="examples">
+  <h2 class="sec"><span class="num">07</span>Ten worked examples</h2>
+
+  <div class="example">
+    <div class="ex-head"><span class="ex-n">01</span><span class="ex-title">A plain, safe scan</span></div>
+    <div class="ex-body">
+      <pre><code><span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --scan</span></code></pre>
+      <p>The default mode. Walks your disk, prints a console report grouped by category with a risk
+      badge on every finding, and ends with "<em>This was a dry run. Nothing was modified.</em>" You can
+      run this as often as you like with zero risk.</p>
+    </div>
+  </div>
+
+  <div class="example">
+    <div class="ex-head"><span class="ex-n">02</span><span class="ex-title">Only old items</span></div>
+    <div class="ex-body">
+      <pre><code><span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --scan <span class="f">--age 90</span></span></code></pre>
+      <p>Reports only findings at least 90 days old, on top of whatever age floor each rule already
+      applies. Good for "show me the stale stuff, not last week's caches". An age of <code>0</code> (the
+      default) is a no-op — it changes nothing.</p>
+    </div>
+  </div>
+
+  <div class="example">
+    <div class="ex-head"><span class="ex-n">03</span><span class="ex-title">Only large items</span></div>
+    <div class="ex-body">
+      <pre><code><span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --scan <span class="f">--min-size 104857600</span></span></code></pre>
+      <p>Reports only findings of at least 100&nbsp;MB (the value is in bytes). Turns a 150,000-item
+      report into the handful of things actually worth your attention.</p>
+    </div>
+  </div>
+
+  <div class="example">
+    <div class="ex-head"><span class="ex-n">04</span><span class="ex-title">Find duplicates</span></div>
+    <div class="ex-body">
+      <pre><code><span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --scan <span class="f">--duplicates</span></span></code></pre>
+      <p>Adds a "Duplicate files" section. Detection is a three-stage funnel — group by exact size, then
+      a sampled hash, then a full hash only on survivors — so it is affordable even over a huge tree.
+      Duplicates are reported as <span class="pill review">Review</span> and their wasted space is shown
+      as its own figure; they are <strong>never</strong> turned into deletion candidates.</p>
+    </div>
+  </div>
+
+  <div class="example">
+    <div class="ex-head"><span class="ex-n">05</span><span class="ex-title">A dedicated largest-files view</span></div>
+    <div class="ex-body">
+      <pre><code><span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --scan <span class="f">--large-files</span></span></code></pre>
+      <p>Adds a top-50 largest-files section beyond the default summary. Useful when a single file, not a
+      category, is the problem.</p>
+    </div>
+  </div>
+
+  <div class="example">
+    <div class="ex-head"><span class="ex-n">06</span><span class="ex-title">A browsable HTML report</span></div>
+    <div class="ex-body">
+      <pre><code><span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --scan <span class="f">--html</span> report.html</span></code></pre>
+      <p>Writes a self-contained HTML report — no external resources, opens offline — with search,
+      sort, and filter over the findings and SVG charts by category. This is the best surface for
+      deciding what to remove before committing to a delete.</p>
+    </div>
+  </div>
+
+  <div class="example">
+    <div class="ex-head"><span class="ex-n">07</span><span class="ex-title">JSON for tooling — capped vs full</span></div>
+    <div class="ex-body">
+      <pre><code><span class="c"># Compact: aggregates + 50 largest findings, marked truncated.</span>
+<span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --scan <span class="f">--json</span> report.json</span>
+
+<span class="c"># Complete: every finding. Can exceed 100 MB on a full scan.</span>
+<span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --scan <span class="f">--json</span> report.json <span class="f">--json-full</span></span></code></pre>
+      <p>Both carry the true totals, category breakdown, and duplicate groups. The capped form adds
+      <code>findingsTruncated: true</code> so a consumer is never misled into thinking a partial document
+      is complete.</p>
+    </div>
+  </div>
+
+  <div class="example">
+    <div class="ex-head"><span class="ex-n">08</span><span class="ex-title">Actually reclaim space</span></div>
+    <div class="ex-body">
+      <pre><code><span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- <span class="f">--delete</span></span></code></pre>
+      <p>Scans, prints the report, then shows "<em>About to move N items (X GB) to the Trash</em>" and
+      waits for you to type <code>yes</code>. Only <span class="pill safe">Safe</span> items are moved.
+      Each goes into a timestamped folder in the Trash with its original directory structure preserved,
+      and a restore script is written to <code>reports/restore-&lt;timestamp&gt;.sh</code> before the
+      first move.</p>
+    </div>
+  </div>
+
+  <div class="example">
+    <div class="ex-head"><span class="ex-n">09</span><span class="ex-title">A narrowed, forced delete</span></div>
+    <div class="ex-body">
+      <pre><code><span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- <span class="f">--delete --force --age 60</span></span></code></pre>
+      <p>Moves both <span class="pill safe">Safe</span> and <span class="pill probably">ProbablySafe</span>
+      items — but only those at least 60 days old. The protected-path veto still applies; Review and
+      above are still untouched. Read the confirmation count carefully before typing <code>yes</code>.</p>
+    </div>
+  </div>
+
+  <div class="example">
+    <div class="ex-head"><span class="ex-n">10</span><span class="ex-title">Undo a delete</span></div>
+    <div class="ex-body">
+      <pre><code><span class="p">sh reports/restore-2026-10-30-143022.sh</span></code></pre>
+      <p>Every <code>--delete</code> writes a restore script. Running it moves each item from the Trash
+      back to its original location. It refuses to overwrite an existing file, recreates missing parent
+      directories, never deletes anything, and is safe to re-run — a second run reports what it skipped
+      rather than clobbering. This works right up until you empty the Trash.</p>
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <span class="label">Bonus — choose the hash algorithm, or use a config file</span>
+    <pre style="margin-top:.6rem"><code><span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --scan --duplicates <span class="f">--hash-algorithm md5</span></span>
+<span class="p">dotnet fsi DiskCleanupAdvisor.fsx -- --scan <span class="f">--config</span> ~/my-cleanup.json</span></code></pre>
+    <p><code>--hash-algorithm</code> (<code>sha256</code> default, or <code>md5</code> for speed on trusted
+    local data) only affects duplicate detection. <code>--config</code> points at a JSON file — see the
+    next section.</p>
+  </div>
+</section>
+
+<!-- 8 ─────────────────────────────────────────── -->
+<section id="flags">
+  <h2 class="sec"><span class="num">08</span>Flag reference</h2>
+  <table>
+    <thead><tr><th>Flag</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--scan</code></td><td>Scan and report. The default when no mode is given.</td></tr>
+      <tr><td><code>--delete</code></td><td>Move Safe-rated items to the Trash, after an interactive confirmation.</td></tr>
+      <tr><td><code>--dry-run</code></td><td>Force scan mode. Overrides <code>--delete</code> — the safer reading of a contradictory command line wins.</td></tr>
+      <tr><td><code>--force</code></td><td>Also permit ProbablySafe items. Never bypasses the protected-path veto.</td></tr>
+      <tr><td><code>--age &lt;days&gt;</code></td><td>Only report items at least this old, on top of each rule's own age floor.</td></tr>
+      <tr><td><code>--min-size &lt;bytes&gt;</code></td><td>Only report items at least this large, on top of each rule's own size floor.</td></tr>
+      <tr><td><code>--duplicates</code></td><td>Detect duplicate files; reported as Review, never deletion candidates.</td></tr>
+      <tr><td><code>--large-files</code></td><td>Add a dedicated top-50 largest-files section.</td></tr>
+      <tr><td><code>--hash-algorithm &lt;alg&gt;</code></td><td><code>sha256</code> (default) or <code>md5</code>. Used only for <code>--duplicates</code>.</td></tr>
+      <tr><td><code>--json &lt;path&gt;</code></td><td>Write a JSON report (50 largest findings; aggregates complete).</td></tr>
+      <tr><td><code>--json-full</code></td><td>Make <code>--json</code> include every finding. Large.</td></tr>
+      <tr><td><code>--markdown &lt;path&gt;</code></td><td>Write a Markdown report.</td></tr>
+      <tr><td><code>--html &lt;path&gt;</code></td><td>Write a self-contained HTML report.</td></tr>
+      <tr><td><code>--config &lt;path&gt;</code></td><td>Use a specific configuration file.</td></tr>
+      <tr><td><code>--allow-root</code></td><td>Permit running with elevated privileges (refused by default).</td></tr>
+      <tr><td><code>--verbose</code></td><td>Debug logging to stderr (stdout stays clean for reports).</td></tr>
+      <tr><td><code>--help</code></td><td>Show usage text.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout">
+    <span class="label">Logs go to stderr, reports to stdout</span>
+    <p>This means <code>--json /dev/stdout</code> stays usable in a pipeline — log lines never corrupt
+    the report.</p>
+  </div>
+</section>
+
+<!-- 9 ─────────────────────────────────────────── -->
+<section id="config">
+  <h2 class="sec"><span class="num">09</span>Configuration file</h2>
+  <p>Configuration is JSON, loaded from <code>--config &lt;path&gt;</code>, else
+  <code>~/.config/diskcleanupadvisor/config.json</code>, else built-in defaults. Every value is
+  optional. Validation reports <em>all</em> problems at once rather than failing on the first.</p>
+  <pre><code>{
+  <span class="f">"ignorePaths"</span>:      ["~/Projects/active"],
+  <span class="f">"ignoreExtensions"</span>: [".psd", ".sketch"],
+  <span class="f">"minSizeBytes"</span>:        1048576,
+  <span class="f">"findingsMinSizeBytes"</span>: 0,
+  <span class="f">"ageThresholdDays"</span>:     30,
+  <span class="f">"hashAlgorithm"</span>:        "sha256",
+  <span class="f">"riskOverrides"</span>:        { "Homebrew Cache": "Review" }
+}</code></pre>
+  <table>
+    <thead><tr><th>Key</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>ignorePaths</code></td><td>Paths excluded from scanning entirely (<code>~</code> is expanded).</td></tr>
+      <tr><td><code>ignoreExtensions</code></td><td>Extensions excluded from results, lower-cased with a leading dot.</td></tr>
+      <tr><td><code>minSizeBytes</code></td><td>Floor for hashing and duplicate detection.</td></tr>
+      <tr><td><code>findingsMinSizeBytes</code></td><td>Floor for what appears as a finding (the config form of <code>--min-size</code>; default 0).</td></tr>
+      <tr><td><code>ageThresholdDays</code></td><td>The config form of <code>--age</code>.</td></tr>
+      <tr><td><code>hashAlgorithm</code></td><td><code>sha256</code> or <code>md5</code>.</td></tr>
+      <tr><td><code>riskOverrides</code></td><td>Map of rule name → new risk level. May only <em>raise</em> risk.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout danger">
+    <span class="label">Risk overrides are raise-only, on purpose</span>
+    <p>You can make the tool treat a Safe rule as Review, but you <strong>cannot</strong> make it treat a
+    Review rule as Safe. An override that tries to lower risk is rejected as a configuration error — the
+    config cannot be used to talk the tool into deleting something it would otherwise protect.</p>
+  </div>
+</section>
+
+<!-- 10 ────────────────────────────────────────── -->
+<section id="reports">
+  <h2 class="sec"><span class="num">10</span>Reports</h2>
+  <p>The console report always prints. The three file formats are additive and render from the same scan
+  result — no format sees data another lacks.</p>
+  <ul>
+    <li><strong>Console</strong> — colour-coded, grouped by category, with the two space figures kept
+      distinct (see below).</li>
+    <li><strong>HTML</strong> (<code>--html</code>) — self-contained, dark-mode aware, searchable and
+      sortable, with SVG charts. The best surface for deciding.</li>
+    <li><strong>JSON</strong> (<code>--json</code>) — machine-readable; capped by default, complete with
+      <code>--json-full</code>.</li>
+    <li><strong>Markdown</strong> (<code>--markdown</code>) — for pasting into notes or a ticket.</li>
+  </ul>
+  <div class="callout">
+    <span class="label">Two space figures, never one</span>
+    <p>Every report shows <strong>reclaimable</strong> (eligible for automatic removal) and
+    <strong>pending review</strong> (needs your judgement) as separate numbers, and never adds them.
+    Conflating them would let you believe space was freed when it had only been listed. When duplicates
+    are enabled, their wasted space is a third, separate figure — also never summed into the others.</p>
+  </div>
+</section>
+
+<!-- 11 ────────────────────────────────────────── -->
+<section id="restore">
+  <h2 class="sec"><span class="num">11</span>Restoring what you moved</h2>
+  <p>Each <code>--delete</code> produces three things, all written <em>before</em> the first move so a
+  crash mid-run still leaves an accurate record:</p>
+  <table>
+    <thead><tr><th>Artifact</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><code>~/.Trash/DiskCleanupAdvisor-&lt;timestamp&gt;/</code></td>
+          <td>The moved files, with their original directory structure mirrored beneath — so restoring
+          is pure path arithmetic, and two files sharing a name never collide.</td></tr>
+      <tr><td><code>reports/deletions-&lt;timestamp&gt;.json</code></td>
+          <td>A journal: every item's path, rule, size, and timestamp.</td></tr>
+      <tr><td><code>reports/restore-&lt;timestamp&gt;.sh</code></td>
+          <td>A shell script that moves everything back. Refuses to overwrite, recreates parents, never
+          deletes, safe to re-run.</td></tr>
+    </tbody>
+  </table>
+  <pre><code><span class="c"># Undo a run — works until you empty the Trash.</span>
+<span class="p">sh reports/restore-2026-10-30-143022.sh</span></code></pre>
+  <div class="callout warn">
+    <span class="label">Earlier builds flattened the Trash — current builds do not</span>
+    <p>A historical version moved files into the Trash by basename alone, which discarded their
+    structure and made restoring to the original locations impossible. Current builds mirror the full
+    path and generate the restore script above. If you are on a build without the
+    <code>DiskCleanupAdvisor-&lt;timestamp&gt;</code> folder, update before relying on restore.</p>
+  </div>
+</section>
+
+<!-- 12 ────────────────────────────────────────── -->
+<section id="rules">
+  <h2 class="sec"><span class="num">12</span>Adding a rule</h2>
+  <p>Rules are plain data. The scanner is parameterised over the rule list and contains no
+  rule-specific logic, so <strong>adding a rule is appending a record</strong> to
+  <code>src/Rules.fsx</code> — no other file changes. Two invariants are enforced by tests:</p>
+  <ul>
+    <li>Only a rule at risk <span class="pill safe">Safe</span> may assert <code>SafeToDelete = true</code>
+      (a helper sets both together so they cannot drift apart).</li>
+    <li>No deletable rule may target a user-data directory.</li>
+  </ul>
+  <p>Rules are matched most-specific-first by resolved root length, which is how a narrow Safe rule can
+  live inside a broad Review one — the exact mechanism that keeps sandboxed app data under
+  <code>~/Library/Containers</code> protected while still cleaning the cache subpaths within it.</p>
+  <div class="callout tip">
+    <span class="label">If you contribute</span>
+    <p>The repository's <code>README.md</code> documents the contributor contract — the trash-only
+    invariant and its audit, the load-order rule, and that privilege-dependent tests must be root-aware —
+    and <code>LESSONS-LEARNED.md</code> records the <em>why</em> behind each design decision and every
+    bug found along the way.</p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <p>DiskCleanupAdvisor · F# 9 / .NET 10 · scan is the default and is always safe · deletion is
+  trash-only and reversible until you empty the Trash. This guide describes the current build; run
+  <code>dotnet fsi DiskCleanupAdvisor.fsx -- --help</code> for the authoritative flag list on your copy.</p>
+</footer>
+
+</body>
+</html>
