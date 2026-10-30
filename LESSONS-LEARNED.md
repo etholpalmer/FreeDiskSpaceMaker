@@ -10,7 +10,7 @@
 - **Build:** none — script-only project, no `.fsproj`, no NuGet
 - **Test runner:** hand-rolled harness at `tests/TestFramework.fsx`, run via `dotnet fsi tests/Tests.fsx`
 - **Workflow:** subagent-driven development, 17 planned tasks, 24 commits
-- **Last Updated:** 2026-07-25
+- **Last Updated:** 2026-10-30
 
 ---
 
@@ -297,9 +297,46 @@ The first three were recoverable with better unit fixtures. The last three requi
 
 ---
 
+### 2026-10-30 — `git push` returned "Repository not found" for a repo `gh` could see
+
+**Symptom:** `git push origin main` → `remote: Repository not found. fatal: repository 'https://github.com/etholpalmer/MacDiskDeleter.git/' not found`, exit non-zero. Yet `gh repo view etholpalmer/MacDiskDeleter` returned the repo, and `gh api repos/etholpalmer/MacDiskDeleter` reported `owner: etholpalmer, private: true, push: true, admin: true` for the active account.
+
+**Attempted (the diagnostic journey):**
+1. Assumed the repo was deleted between sessions — disproved: `gh repo view` showed it live and private.
+2. Suspected the wrong one of two logged-in GitHub accounts (`etholpalmer` active, `PalmerPalmerTM` also authed). Retried with gh's credential helper for the one command: `git -c credential.helper='!gh auth git-credential' push`. **Still failed** — the added helper was not the one git consulted.
+3. Confirmed the active account genuinely owns + can push via the API. So it was not a permissions problem at all — it was *which credential git sent*.
+
+**Root cause:** git's HTTPS credential helpers are tried **in order**, and the globally-configured macOS keychain helper answered *first* with a stale/other-account token that could not see the private repo. GitHub masks 403 as 404, so "no access with this token" surfaced as "Repository not found". Adding a second helper with `-c` does not displace the first.
+
+**Fix:** reset the helper list for the one command, then add only gh's, so the keychain helper never answers: `git -c credential.helper= -c credential.helper='!gh auth git-credential' push origin main`. The empty value clears previously-configured helpers. Pushed `fead9cd..6db3bd8`; the pre-push CI gate ran both legs green on the way out.
+
+**Prevention:** durable fix is `gh auth setup-git` (routes github.com through gh) or deleting the stale `github.com` entry from Keychain Access. Meta-pattern: *credential-helper-order masking* — a 404 from a host that a sibling tool can reach is an auth-routing problem, not a missing resource; check which credential the failing tool actually sent before trusting the error's noun.
+
+**Time Lost:** ~10 minutes, three push attempts.
+
+**Severity:** Low — no data risk, commits safe locally throughout; purely a push-routing dead end.
+
+**Related:** Compromise — "Remote changed between sessions" (below).
+
+---
+
 ## Solution Gaps
 
 ## Compromises
+
+### 2026-10-30 — Remote changed between sessions; a plain `git push` targets an unreachable LAN box
+
+**Tradeoff:** Between the July and October sessions a second remote was added — `ci` → `http://10.0.0.126:3000/...` (a LAN Gitea) alongside `origin` → GitHub. The branch's default push target became `ci`, which was unreachable (connect timeout), so `git push` with no explicit remote failed before GitHub was ever contacted.
+
+**Reason:** The user's own remote topology; not something this project controls. Documented rather than "fixed" because choosing a default push remote is the user's call, not the tool's.
+
+**Impact:** A bare `git push` fails when the LAN box is down. Pushing to GitHub requires naming it: `git push origin main` (plus the credential-order workaround above).
+
+**Prevention going forward OR accepted recurrence:** **Accepted recurrence.** The mechanism is explicitness: always `git push origin main`, never bare `git push`, in this repo until the user settles the default. Stated here so the next session does not re-diagnose the timeout from scratch.
+
+**Revisit When:** the user picks a single canonical remote, or sets `branch.main.pushRemote`.
+
+**Related:** Mistake — "git push returned Repository not found".
 
 ### 2026-07-21 — Parallel traversal declined despite a 90-second scan
 
