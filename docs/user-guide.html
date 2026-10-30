@@ -406,8 +406,65 @@
     <p>On macOS, a local Time Machine snapshot can hold on to the blocks you just freed, so emptying
     the Trash appears to reclaim nothing. The tool reports any snapshots it finds and prints the
     <code>tmutil</code> commands — but it will not run them.</p>
-    <p class="fix"><strong>Do:</strong> if free space does not move after emptying the Trash, run
-    <code>tmutil listlocalsnapshots /</code> then <code>tmutil deletelocalsnapshots &lt;date&gt;</code>.</p>
+    <p class="fix"><strong>Do:</strong> if free space does not move after emptying the Trash, inspect
+    and thin or remove the snapshots with <code>tmutil</code> — worked examples below.</p>
+  </div>
+
+  <div class="callout">
+    <span class="label">Working with local snapshots — <code>tmutil</code></span>
+    <p><code>tmutil</code> ships with macOS. These are <strong>local</strong> snapshots on your boot
+    volume — separate from your Time Machine backup disk, which none of these commands touch. All of
+    them need no special privileges to <em>list</em>; deleting may prompt for your password.</p>
+
+    <h3 style="margin-top:1rem">1 · List snapshots on a volume</h3>
+    <pre><code><span class="p">tmutil listlocalsnapshots /</span>
+<span class="c">Snapshots for disk /:
+com.apple.TimeMachine.2026-10-26-093035.local (dataless)
+com.apple.TimeMachine.2026-10-27-204125.local</span></code></pre>
+    <p>The timestamp in each name is <code>YYYY-MM-DD-HHMMSS</code> — here, one snapshot from
+    26&nbsp;Oct 09:30:35 and one from 27&nbsp;Oct 20:41:25. <code>(dataless)</code> means the system has
+    already partially purged that snapshot's data under disk pressure; it still holds metadata and is
+    worth removing explicitly to release it fully.</p>
+
+    <h3>2 · List just the dates (handy for scripting)</h3>
+    <pre><code><span class="p">tmutil listlocalsnapshotdates /</span>
+<span class="c">Snapshot dates for disk /:
+2026-10-26-093035
+2026-10-27-204125</span></code></pre>
+    <p>Same information, stripped to the bare date stamps — exactly the form the delete command below
+    expects.</p>
+
+    <h3>3 · Delete one snapshot by date</h3>
+    <pre><code><span class="p">tmutil deletelocalsnapshots 2026-10-26-093035</span>
+<span class="c">Deleted local snapshot '2026-10-26-093035'</span></code></pre>
+    <p>Pass the <strong>date stamp only</strong> — <code>2026-10-26-093035</code>, not the full
+    <code>com.apple.TimeMachine.…</code> name. A date argument deletes the snapshot with that timestamp
+    on <em>every</em> mounted disk that has one.</p>
+
+    <h3>4 · Delete every local snapshot on a volume</h3>
+    <pre><code><span class="p">tmutil deletelocalsnapshots /</span>
+<span class="c">Deleted local snapshot '2026-10-26-093035'
+Deleted local snapshot '2026-10-27-204125'</span></code></pre>
+    <p>Giving a <strong>mount point</strong> instead of a date removes <em>all</em> local snapshots on
+    that volume. This is the blunt "reclaim it all now" option.</p>
+
+    <h3>5 · Thin snapshots to free a target amount</h3>
+    <pre><code><span class="c"># Ask macOS to free ~20 GB (20 × 1024³ = 21474836480 bytes), urgency 4 (most aggressive).</span>
+<span class="p">tmutil thinlocalsnapshots / 21474836480 4</span>
+<span class="c">Thinning local snapshots on disk / ...
+com.apple.TimeMachine.2026-10-26-093035.local</span></code></pre>
+    <p>The gentlest option: <code>purge_amount</code> is in <strong>bytes</strong>, <code>urgency</code>
+    is 1–4 (higher is more aggressive). macOS removes the oldest snapshots until it has tried to free
+    that much, and prints which it thinned. It may free less than requested if fewer snapshots exist.</p>
+
+    <div class="callout warn" style="margin-top:1rem">
+      <span class="label">Before you delete</span>
+      <p>Local snapshots are macOS's short-term "undo" for your whole volume — they back recovery of
+      recently-changed files between full Time Machine backups. Removing them is safe and routine when
+      you need the space, but you lose those intermediate restore points until the next snapshot is
+      taken. DiskCleanupAdvisor reports snapshots and prints these commands; it never runs them, because
+      a snapshot delete is a system-level action outside its trash-only model.</p>
+    </div>
   </div>
 
   <div class="footgun">
