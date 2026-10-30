@@ -17,6 +17,11 @@ A dry-run scan is the default: running the tool with no arguments only
 reports. Nothing is modified unless you pass `--delete` and then type `yes`
 at an explicit confirmation prompt.
 
+> **New here? Read the [full user guide](docs/user-guide.html)** — a
+> self-contained HTML walkthrough with the risk model, twelve warnings and
+> footguns, ten worked examples, and restore instructions. Open it in a
+> browser. This README is the quick reference; the guide is the manual.
+
 ## Requirements
 
 - .NET 10 SDK (for `dotnet fsi`)
@@ -55,6 +60,56 @@ moves items to the platform Trash (never a raw unlink). It reports how many
 items moved and reminds you that the space is not yet reclaimed until you
 empty the Trash.
 
+## Risk levels
+
+Every finding carries one of five risk levels. Only the first is ever removed
+automatically; the second only with `--force`. The rest are reported for your
+judgement and are never deleted by the tool.
+
+| Level | Icon | Meaning | Auto-deleted? |
+|---|---|---|---|
+| `Safe` | ✓ | Regenerable, no user data; the producing tool recreates it on demand. | Yes, with `--delete` |
+| `ProbablySafe` | ○ | Regenerable, but an app may re-download it or it holds a locally-built artifact. | Only with `--delete --force` |
+| `Review` | ? | Needs human judgement — may be app state, documents, or a copy something depends on. | Never |
+| `Dangerous` | ! | Deletion is likely to break something. | Never |
+| `NeverDelete` | ✕ | Protected. No flag overrides this. | Never |
+
+Duplicates, `node_modules`, VM images, and iOS Simulator data are rated
+`Review` — reported prominently but never auto-removed, because identical
+bytes do not make a copy disposable and the largest consumers are usually the
+ones you must judge yourself. Use the purpose-built tool for those
+(`docker system prune`, `xcrun simctl delete unavailable`, `podman machine rm`).
+
+## Important warnings
+
+The safety model means none of these can cause data loss — but each is a
+place the tool's honest behaviour can surprise you. The
+[user guide](docs/user-guide.html) covers all twelve in full.
+
+- **Moving to Trash frees nothing yet.** `--delete` *moves* files to the
+  Trash; your free space changes only when *you* empty it. Emptying the Trash
+  is the one irreversible step, and the tool never does it for you.
+- **`--delete` with no filters takes the whole Safe set.** Combine it with
+  `--age` / `--min-size` to narrow the set; the confirmation prompt shows the
+  count and total size before you commit.
+- **`--force` is narrow.** It widens deletion by exactly one level
+  (`ProbablySafe`). It never touches Review and above, and never bypasses the
+  denylist veto. There is no "delete everything" flag.
+- **Time Machine local snapshots pin freed space (macOS).** If emptying the
+  Trash reclaims nothing, local snapshots may hold the blocks. The tool
+  reports them and prints the `tmutil` commands but never runs them — see the
+  Time Machine section below.
+- **Reported sizes are allocated, not apparent.** Sparse files (Docker/Podman
+  images) show their on-disk size — `du -h` agrees, `ls -l` shows the inflated
+  logical length.
+- **A file changed since the scan is skipped, not moved.** "N items could not
+  be moved" after a delete usually means something wrote to a cache while you
+  were deciding.
+- **Windows refuses `--delete`.** Recycle Bin needs a platform call this
+  script-only tool does not make, and an irreversible `unlink` fallback would
+  defeat the safety model, so `--delete` errors rather than degrading.
+  Scanning and reporting work normally.
+
 ## Command-line flags
 
 | Flag | Meaning |
@@ -63,7 +118,8 @@ empty the Trash.
 | `--delete` | Move Safe-rated items to Trash, after confirmation. |
 | `--dry-run` | Force scan mode. Overrides `--delete` regardless of argument order. |
 | `--help` | Show usage text. |
-| `--json <path>` | Write a JSON report. |
+| `--json <path>` | Write a JSON report — the 50 largest findings, marked `findingsTruncated: true`; all aggregate totals stay accurate. |
+| `--json-full` | Make `--json` include *every* finding. Large — a full scan can exceed 100 MB. |
 | `--markdown <path>` | Write a Markdown report. |
 | `--html <path>` | Write a self-contained HTML report (inline CSS/JS/SVG, no network access). |
 | `--duplicates` | Detect duplicate files by content hash. |
@@ -93,6 +149,7 @@ with three mistakes is fixed in one pass rather than three runs.
   "ignorePaths": ["/Users/me/Projects/keep-this-cache"],
   "ignoreExtensions": [".psd"],
   "minSizeBytes": 1048576,
+  "findingsMinSizeBytes": 0,
   "ageThresholdDays": 30,
   "threadCount": 8,
   "hashAlgorithm": "sha256",
@@ -106,7 +163,8 @@ with three mistakes is fixed in one pass rather than three runs.
 |---|---|---|
 | `ignorePaths` | string array | Absolute paths excluded from scanning entirely. |
 | `ignoreExtensions` | string array | Lowercase extensions (with leading dot) excluded from results. |
-| `minSizeBytes` | integer ≥ 0 | Files below this size are ignored for hashing and large-file reporting. |
+| `minSizeBytes` | integer ≥ 0 | Floor for hashing and duplicate detection. |
+| `findingsMinSizeBytes` | integer ≥ 0 | Floor for what appears as a finding — the config form of `--min-size` (default 0). |
 | `ageThresholdDays` | integer ≥ 0 | Items younger than this are not considered stale. |
 | `threadCount` | integer, 1–64 | Traversal parallelism setting. |
 | `hashAlgorithm` | `"sha256"` or `"md5"` | Algorithm used for duplicate detection. |
@@ -162,6 +220,26 @@ tmutil deletelocalsnapshots <date>
 The tool does not run these commands itself — deleting a snapshot is a
 system-level operation with its own consequences, outside this tool's
 Trash-only safety model. You decide whether and when to run it.
+
+## Restoring what you moved
+
+Every `--delete` writes three artifacts *before* the first move, so a crash
+mid-run still leaves an accurate record:
+
+| Artifact | What it is |
+|---|---|
+| `~/.Trash/DiskCleanupAdvisor-<timestamp>/` | The moved files, with their original directory structure mirrored beneath — so two files sharing a name never collide and restoring is pure path arithmetic. |
+| `reports/deletions-<timestamp>.json` | A journal: every item's path, rule, size, and timestamp. |
+| `reports/restore-<timestamp>.sh` | A script that moves everything back. Refuses to overwrite, recreates parent directories, never deletes, safe to re-run. |
+
+```bash
+# Undo a run — works right up until you empty the Trash.
+sh reports/restore-2026-10-30-143022.sh
+```
+
+Restore works until you empty the Trash; after that the files are gone and the
+script can no longer bring anything back. See the
+[user guide](docs/user-guide.html) for the full walkthrough.
 
 ## Adding a rule
 
